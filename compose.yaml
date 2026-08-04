@@ -1,0 +1,115 @@
+name: deepseek-v4
+
+services:
+  inference:
+    image: vllm/vllm-openai-rocm@sha256:e68d18b2ba50298661bfc49baf01158fbf036645c2362cccf3e8a7a79fe6c69a
+    restart: unless-stopped
+    init: true
+    ipc: host
+    cap_add: [SYS_PTRACE, IPC_LOCK]
+    ulimits:
+      memlock: -1
+    security_opt: [seccomp=unconfined, label=disable]
+    devices:
+      - /dev/kfd:/dev/kfd
+      - /dev/dri:/dev/dri
+    environment:
+      VLLM_ROCM_USE_AITER: "1"
+      VLLM_ROCM_USE_SKINNY_GEMM: "0"
+      HSA_COREDUMP_PATTERN: /var/crash/vllm/gpucore.%p
+      AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE: /opt/aiter-configs/dsv4-mi300x-a8w8-blockscale-bpreshuffle.csv
+    volumes:
+      - /root/.cache/huggingface:/root/.cache/huggingface:ro
+      - ./aiter-cache:/root/.aiter
+      - ./crash-dumps:/var/crash/vllm
+      - ./vllm-entrypoint.sh:/opt/vllm-entrypoint.sh:ro
+      - ./tuning/dsv4-mi300x-a8w8-blockscale-bpreshuffle-ck.prefill-m2688.csv:/opt/aiter-configs/dsv4-mi300x-a8w8-blockscale-bpreshuffle.csv:ro
+      - ./tuning/dsv4-a8w8-blockscale-tuned-gemm.mi300x.prefill-m2688.csv:/usr/local/lib/python3.12/dist-packages/aiter/configs/model_configs/dsv4_a8w8_blockscale_tuned_gemm.csv:ro
+      # Fix padded MXFP4 lanes misrouting tokens (doublewordai/vllm-amd-blog-doubleword@c32932bb9).
+      - ./patches/gpt_oss_triton_kernels_moe.pack128-fused-silu-fast-routing.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/fused_moe/experts/gpt_oss_triton_kernels_moe.py:ro
+      - ./patches/mxfp4.fused-silu.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/fused_moe/oracle/mxfp4.py:ro
+      - ./patches/triton-kernels-matmul-ogs-opt-flags.dsv4-mi300x.py:/usr/local/lib/python3.12/dist-packages/vllm/third_party/triton_kernels/matmul_ogs_details/opt_flags.py:ro
+      - ./patches/fused_compress_quant_cache.fnuz-shuffle.py:/usr/local/lib/python3.12/dist-packages/vllm/models/deepseek_v4/common/ops/fused_compress_quant_cache.py:ro
+      - ./patches/aiter_pa_mqa_logits.i64.py:/usr/local/lib/python3.12/dist-packages/aiter/ops/triton/gluon/pa_mqa_logits.py:ro
+      - ./patches/rocm_aiter_mla_sparse.prefill-bh64.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py:ro
+      # vLLM 77469c9: keep speculative verify attention causal on ROCm small-head MLA.
+      - ./patches/rocm_aiter_mla.dspark-causal.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/rocm_aiter_mla.py:ro
+      - ./patches/dspark-speculator.independent-draft-gumbel.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py:ro
+      - ./patches/spec-decode-utils.independent-draft-gumbel.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/spec_decode/utils.py:ro
+      # Fence native CPU KV transfers behind in-flight compute (vLLM #47282 / PR #47291).
+      - ./patches/kv_offload_cpu_gpu_worker.load-war.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/kv_offload/cpu/gpu_worker.py:ro
+    entrypoint: [/opt/vllm-entrypoint.sh]
+    command:
+      - /root/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash-0731/snapshots/7872f01b1d1fe23eabc4c98b48bffcef5a386062
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --served-model-name
+      - deepseek-ai/DeepSeek-V4-Flash-0731
+      - --trust-remote-code
+      - --tokenizer-mode
+      - deepseek_v4
+      - --generation-config
+      - vllm
+      - --reasoning-parser
+      - deepseek_v4
+      - --tool-call-parser
+      - deepseek_v4
+      - --enable-auto-tool-choice
+      - --enable-prompt-tokens-details
+      - --kv-cache-dtype
+      - fp8
+      - --block-size
+      - "256"
+      - --max-model-len
+      - "262144"
+      - --kv-cache-memory-bytes
+      - "20000000000"
+      - --kv-offloading-size
+      - "96"
+      - --kv-offloading-backend
+      - native
+      - --max-num-seqs
+      - "64"
+      - --max-num-batched-tokens
+      - "2048"
+      - --long-prefill-token-threshold
+      - "1024"
+      - --moe-backend
+      - triton
+      - --linear-backend
+      - auto
+      - --speculative-config.method=dspark
+      - --speculative-config.num-speculative-tokens=7
+      - --speculative-config.draft-sample-method=probabilistic
+      - --speculative-config.rejection-sample-method=block
+    healthcheck:
+      test: [CMD, curl, -fsS, http://127.0.0.1:8000/health]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 6m
+    stop_grace_period: 2m
+    logging:
+      options:
+        max-size: 100m
+        max-file: "5"
+
+  caddy:
+    image: caddy@sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648
+    restart: unless-stopped
+    ports:
+      - 443:443
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    logging:
+      options:
+        max-size: 100m
+        max-file: "5"
+
+volumes:
+  caddy_data:
+  caddy_config:

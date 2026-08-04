@@ -1,0 +1,36 @@
+--- a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
++++ b/dspark-speculator.independent-draft-gumbel.py
+@@ -32,6 +32,7 @@
+ from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+ from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
+ from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
++from vllm.v1.worker.gpu.spec_decode.utils import draft_gumbel_pos
+ 
+ 
+ class DSparkSpeculator(DFlashSpeculator):
+@@ -82,7 +83,7 @@
+         # Reduced draft vocab: probabilistic rejection sampling indexes draft
+         # logits by target id, so precompute the draft->target column map and a
+         # scratch buffer to scatter logits into target vocab before sampling.
+-        if self.draft_logits is not None and model.draft_id_to_target_id is not None:
++        if self.draft_logits is not None and getattr(model, "draft_id_to_target_id", None) is not None:
+             d2t = model.draft_id_to_target_id
+             self._d2t_scatter_index = (
+                 torch.arange(d2t.shape[0], device=d2t.device) + d2t
+@@ -128,14 +129,13 @@
+                     buf = self._draft_scatter_buf[:num_reqs]
+                     buf.index_copy_(1, self._d2t_scatter_index, logits_i.to(buf.dtype))
+                     logits_i = buf
+-                # sample_pos is the predicted token's position Q; the target
+-                # verifies it with the predecessor's Gumbel key (Q-1). Pass Q-1.
++                # Salt draft noise away from rejection acceptance/recovery noise.
+                 draft_sampled_i = gumbel_sample(
+                     logits_i,
+                     idx_map[:, i],
+                     self.temperature,
+                     self.seeds,
+-                    sample_pos[:, i] - 1,
++                    draft_gumbel_pos(sample_pos[:, i] - 2),
+                     apply_temperature=True,
+                     output_processed_logits=self.draft_logits,
+                     output_processed_logits_col=self._step_cols[i],

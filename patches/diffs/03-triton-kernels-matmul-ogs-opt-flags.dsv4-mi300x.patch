@@ -1,0 +1,39 @@
+--- a/triton_kernels/matmul_ogs_details/opt_flags.py
++++ b/triton-kernels-matmul-ogs-opt-flags.dsv4-mi300x.py
+@@ -161,6 +161,36 @@
+         arch=None,
+         target_kernel_kwargs=target_kernel_kwargs,
+     )
++    if (
++        not constraints
++        and get_cdna_version() == 3
++        and routing_data is not None
++        and routing_data.n_expts_tot == 256
++        and routing_data.n_expts_act == 6
++        and bitwidth(lhs_dtype) == 16
++        and rhs_dtype == FP4
++        and precision_config.weight_scale is not None
++    ):
++        if m <= 1536:
++            ret.block_m = 16
++            ret.block_n = 32 if m <= 12 else 128
++            ret.block_k = 256
++            if m <= 6:
++                ret.num_warps = 2
++                ret.target_kernel_kwargs["waves_per_eu"] = 2
++            elif m <= 12:
++                ret.num_warps = 2
++            elif m <= 24:
++                ret.num_warps = 8
++            else:
++                ret.num_warps = 4
++                ret.target_kernel_kwargs["waves_per_eu"] = 2
++        else:
++            # BN=256 holds enough accumulator registers to cap MI300X occupancy
++            # near 24%. BN=128 raises both occupancy and MFMA utilization.
++            ret.block_n = 128
++            if ret.block_m == 32:
++                ret.block_k = 256
+     # check constraints
+     all_constraints_satisfied(ret, constraints)
+     return ret

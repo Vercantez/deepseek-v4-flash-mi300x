@@ -1,0 +1,22 @@
+{
+	email you@example.com
+}
+
+your-host.example.com {
+	@allowed {
+		remote_ip 203.0.113.0/24
+		path /v1/chat/completions /v1/completions /v1/models /health /metrics /generate
+	}
+	handle @allowed {
+		reverse_proxy inference:8000 {
+			flush_interval -1
+		}
+	}
+	handle {
+		respond "Forbidden" 403
+	}
+	log {
+		output stdout
+		format json
+	}
+}

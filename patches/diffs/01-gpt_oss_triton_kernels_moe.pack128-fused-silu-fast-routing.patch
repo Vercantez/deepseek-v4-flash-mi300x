@@ -1,0 +1,246 @@
+--- a/vllm/model_executor/layers/fused_moe/experts/gpt_oss_triton_kernels_moe.py
++++ b/gpt_oss_triton_kernels_moe.pack128-fused-silu-fast-routing.py
+@@ -120,7 +120,7 @@
+         # below without producing any output.
+         offs_local = tl.arange(0, BLOCK_SIZE_PADDED)
+         offs_global = pid_m * BLOCK_SIZE + offs_local
+-        mask = offs_global < nonzero_indx_size
++        mask = (offs_local < BLOCK_SIZE) & (offs_global < nonzero_indx_size)
+         col_indx = tl.load(NonzeroIndx + offs_global, mask=mask, other=-1).to(tl.uint32)
+         kv_pairs = ((col_indx << 16) | offs_local).to(tl.uint32)
+         kv_pairs = tl.sort(kv_pairs, 0)
+@@ -474,6 +474,9 @@
+                 SparseMatrix,
+                 make_ragged_tensor_metadata,
+             )
++            from triton_kernels.tensor_details.ragged_tensor import (
++                RaggedTensorMetadata,
++            )
+         except ImportError:
+             # TODO(mgoin): drop the v3.5.1 pin and remove this fallback once
+             # the gpt-oss perf regression in v3.6.0+ is resolved upstream.
+@@ -626,6 +629,16 @@
+     )
+ 
+ 
++@triton.jit
++def _silu_mul(inp):
++    gate, up = tl.split(
++        tl.reshape(inp, (inp.shape[0], inp.shape[1] // 2, 2))
++    )
++    gate = gate.to(tl.float32)
++    up = up.to(tl.float32)
++    return gate / (1.0 + tl.exp(-gate)) * up
++
++
+ # This is a triton implementation of the fused_experts function
+ def triton_kernel_fused_experts(
+     output_tensor: torch.Tensor,
+@@ -647,9 +660,7 @@
+     a1q_scale: torch.Tensor | None = None,
+ ) -> torch.Tensor:
+     """Triton implementation of fused expert computation using OAI kernels."""
+-    assert activation == MoEActivation.SWIGLUOAI, (
+-        "Only SWIGLUOAI activation is supported"
+-    )
++    assert activation in (MoEActivation.SILU, MoEActivation.SWIGLUOAI)
+     assert quant_config is not None
+ 
+     # type check, uint8 means mxfp4
+@@ -682,8 +693,12 @@
+     )
+     output_tensor = _resize_cache(output_tensor, (batch_dim, M, K))
+ 
+-    act = (
+-        FusedActivation(
++    if activation == MoEActivation.SILU:
++        act = FusedActivation(
++            FnSpecs("silu_mul", _silu_mul, (), reduction_n=2), ()
++        )
++    elif not use_legacy_triton_kernels:
++        act = FusedActivation(
+             FnSpecs(
+                 "swiglu",
+                 triton_kernels.swiglu.swiglu_fn,
+@@ -692,13 +707,12 @@
+             ),
+             (swiglu_alpha, swiglu_limit),
+         )
+-        if not use_legacy_triton_kernels
+-        else FusedActivation(
++    else:
++        act = FusedActivation(
+             FnSpecs("swiglu", triton_kernels.swiglu.swiglu_fn, ("alpha", "limit")),
+             (swiglu_alpha, swiglu_limit),
+             2,
+         )
+-    )
+     gammas = routing_data.gate_scal if routing_data else None
+ 
+     matmul_ogs(
+@@ -727,21 +741,143 @@
+     return output_tensor
+ 
+ 
++@triton.jit
++def _fast_deepseek_routing(
++    Ids,
++    Weights,
++    Combine,
++    Dispatch,
++    Gate,
++    Hist,
++    SliceOffs,
++    BlockOffs,
++    BlockSchedule,
++    N: tl.constexpr,
++    E: tl.constexpr,
++    SORT: tl.constexpr,
++    MAX_TILES: tl.constexpr,
++    SCHED: tl.constexpr,
++    MAX_BLOCKS_PER_EXPERT: tl.constexpr,
++):
++    offs = tl.arange(0, SORT)
++    mask = offs < N
++    expert = tl.load(Ids + offs, mask=mask, other=-1).to(tl.int32)
++    active = mask & (expert >= 0) & (expert < E)
++    sentinel: tl.constexpr = 0x7FFFFFFF
++    keys = tl.sort(tl.where(active, expert * SORT + offs, sentinel), 0)
++    sorted_active = keys != sentinel
++    sorted_idx = keys % SORT
++    tl.store(Combine + offs, tl.where(sorted_active, sorted_idx, -1), mask=mask)
++    vals = tl.load(Weights + sorted_idx, mask=sorted_active, other=-1.0)
++    tl.store(Gate + offs, tl.where(sorted_active, vals, -1.0), mask=mask)
++    tl.store(Dispatch + offs, -1, mask=mask)
++
++    experts = tl.arange(0, E)
++    tl.store(Hist + experts, 0)
++    schedule = tl.arange(0, SCHED)
++    for size_id in tl.static_range(0, 5):
++        tl.store(
++            BlockSchedule + size_id * MAX_TILES + schedule,
++            -1,
++            mask=schedule < MAX_TILES,
++        )
++    tl.debug_barrier()
++
++    tl.store(Dispatch + sorted_idx, offs, mask=sorted_active)
++    tl.atomic_add(Hist + expert, 1, mask=active)
++    tl.debug_barrier()
++
++    hist = tl.load(Hist + experts)
++    cumulative = tl.cumsum(hist, 0)
++    tl.store(SliceOffs + experts, cumulative - hist)
++    tl.store(SliceOffs + E, tl.sum(hist))
++    for size_id in tl.static_range(0, 5):
++        log2_block = 4 + size_id
++        nblocks = (hist + (1 << log2_block) - 1) >> log2_block
++        cumulative_blocks = tl.cumsum(nblocks, 0)
++        starts = cumulative_blocks - nblocks
++        block_offs = BlockOffs + size_id * (E + 1)
++        tl.store(block_offs + experts, starts)
++        tl.store(block_offs + E, tl.sum(nblocks))
++        for block in tl.static_range(0, MAX_BLOCKS_PER_EXPERT):
++            tl.store(
++                BlockSchedule + size_id * MAX_TILES + starts + block,
++                (block << 16) + experts,
++                mask=block < nblocks,
++            )
++
++
++def _fast_make_routing_data(topk_ids, topk_weights, num_local_experts):
++    n_rows, num_topk = topk_ids.shape
++    n_assignments = n_rows * num_topk
++    max_tiles = RaggedTensorMetadata.max_n_tiles(
++        num_local_experts, n_assignments
++    )
++    device = topk_ids.device
++    combine = torch.empty(n_assignments, dtype=torch.int32, device=device)
++    dispatch = torch.empty_like(combine)
++    gate = torch.empty(n_assignments, dtype=torch.bfloat16, device=device)
++    hist = torch.empty(num_local_experts, dtype=torch.int32, device=device)
++    slice_offs = torch.empty(num_local_experts + 1, dtype=torch.int32, device=device)
++    block_offs = torch.empty(
++        (5, num_local_experts + 1), dtype=torch.int32, device=device
++    )
++    block_schedule = torch.empty((5, max_tiles), dtype=torch.int32, device=device)
++    _fast_deepseek_routing[(1,)](
++        topk_ids,
++        topk_weights,
++        combine,
++        dispatch,
++        gate,
++        hist,
++        slice_offs,
++        block_offs,
++        block_schedule,
++        N=n_assignments,
++        E=num_local_experts,
++        SORT=triton.next_power_of_2(n_assignments),
++        MAX_TILES=max_tiles,
++        SCHED=triton.next_power_of_2(max_tiles),
++        # Top-k has no duplicate expert within a row, including padded rows.
++        MAX_BLOCKS_PER_EXPERT=triton.cdiv(n_rows, 16),
++        num_warps=4,
++    )
++    metadata = RaggedTensorMetadata(hist, slice_offs, block_offs, block_schedule)
++    routing_data = RoutingData(
++        gate, metadata.block_sizes, num_local_experts, num_topk, metadata
++    )
++    return (
++        routing_data,
++        GatherIndx(combine, dispatch),
++        ScatterIndx(dispatch, combine),
++    )
++
++
+ def make_routing_data(
+     topk_ids: torch.Tensor,
+     topk_weights: torch.Tensor,
+     num_local_experts: int,
+ ) -> tuple["RoutingData", torch.Tensor, torch.Tensor]:
++    n_rows, num_topk = topk_ids.size()
++    if (
++        not use_legacy_triton_kernels
++        and num_local_experts == 256
++        and num_topk == 6
++        and 0 < n_rows <= 128
++        and topk_ids.is_contiguous()
++        and topk_weights.is_contiguous()
++    ):
++        return _fast_make_routing_data(topk_ids, topk_weights, num_local_experts)
++
+     topk_ids = topk_ids.to(torch.int16)
+     topk_weights = topk_weights.to(torch.bfloat16)
+ 
+-    n_rows, num_topk = topk_ids.size()
+-
+-    BLOCK_SIZE_M = 512
++    # The 512-row CUDA tile spends ~24 us/layer on masked lanes at MI300 decode sizes.
++    BLOCK_SIZE_M = 128
+     BLOCK_SIZE_K = 32
+ 
+     bm_cols = triton.cdiv(num_local_experts, BLOCK_SIZE_K)  # n_bitpacks
+-    bitmatrix = torch.zeros(
++    bitmatrix = torch.empty(
+         (n_rows, bm_cols), dtype=torch.uint32, device=topk_ids.device
+     )
+ 
+@@ -965,7 +1101,7 @@
+ 
+     @staticmethod
+     def _supports_activation(activation: MoEActivation) -> bool:
+-        return activation == MoEActivation.SWIGLUOAI
++        return activation in (MoEActivation.SILU, MoEActivation.SWIGLUOAI)
+ 
+     @staticmethod
+     def activation_format() -> mk.FusedMoEActivationFormat:
+@@ -1324,7 +1460,7 @@
+ 
+     @staticmethod
+     def _supports_activation(activation: MoEActivation) -> bool:
+-        return activation == MoEActivation.SWIGLUOAI
++        return activation in (MoEActivation.SILU, MoEActivation.SWIGLUOAI)
+ 
+     @staticmethod
+     def _supports_parallel_config(

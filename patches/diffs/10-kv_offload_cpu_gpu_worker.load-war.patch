@@ -1,0 +1,15 @@
+--- a/vllm/v1/kv_offload/cpu/gpu_worker.py
++++ b/kv_offload_cpu_gpu_worker.load-war.py
+@@ -373,9 +373,9 @@
+             else torch.Event(enable_timing=True)
+         )
+ 
+-        if self.gpu_to_cpu:
+-            # wait for model computation to finish before offloading
+-            stream.wait_stream(current_platform.current_stream())
++        # Both directions touch live GPU KV blocks: stores read blocks compute may
++        # still write, while loads may overwrite blocks compute may still read.
++        stream.wait_stream(current_platform.current_stream())
+         if self._transfers:
+             last_transfer: Transfer = self._transfers[-1]
+             last_event = last_transfer.end_event

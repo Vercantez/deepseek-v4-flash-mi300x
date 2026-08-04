@@ -1,0 +1,13 @@
+# Local runtime state (bind mounts referenced by compose.yaml)
+aiter-cache/
+crash-dumps/
+
+# Your real Caddyfile contains a hostname, email, and source CIDR.
+# Copy Caddyfile.example to Caddyfile and edit it.
+Caddyfile
+
+# Editor/OS noise
+.DS_Store
+*.swp
+*.swo
+__pycache__/

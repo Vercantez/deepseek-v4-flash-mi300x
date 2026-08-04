@@ -1,0 +1,289 @@
+--- a/aiter/ops/triton/gluon/pa_mqa_logits.py
++++ b/aiter_pa_mqa_logits.i64.py
+@@ -1,24 +1,19 @@
+ # SPDX-License-Identifier: MIT
+ # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+-# ruff: noqa: EXE005  the `#!=----` separators below are decorative
+-# comments, not shebangs; ruff's heuristic flags all 66 of them.
+ 
+ import triton
+ import triton.language as tl
+-from triton.experimental import gluon
+-from triton.experimental.gluon import language as gl
+ 
+ from aiter.ops.triton.gluon.pa_decode_gluon import get_cdna_version
+ 
++from triton.experimental import gluon
++from triton.experimental.gluon import language as gl
++
+ try:
+     from triton.experimental.gluon.language.amd.cdna3 import (
+-        s_set_prio as _amd_s_set_prio,
+-    )
+-    from triton.experimental.gluon.language.amd.cdna3 import (
+         sched_barrier as _amd_iglp_sched_barrier,
+-    )
+-    from triton.experimental.gluon.language.amd.cdna3 import (
+         sched_group_barrier as _amd_iglp_sched_group_barrier,
++        s_set_prio as _amd_s_set_prio,
+     )
+ except ImportError:
+     # ignore iglp hint
+@@ -47,7 +42,7 @@
+         tiles_per_warp=[1, 1],
+     )
+     _Use_2d_instr_shape_mfma_layout = tl.constexpr(True)
+-except Exception:  # noqa: BLE001
++except Exception:
+     _Use_2d_instr_shape_mfma_layout = tl.constexpr(False)
+ 
+ 
+@@ -530,7 +525,7 @@
+             desc_scale_cur, [blk_cur, 0], kv_scale_shared.index(0)
+         )
+ 
+-        for j in range(n_blocks):
++        for j in range(0, n_blocks):
+             buf = j % NUM_BUFFERS
+             context_idx = split_context_start + j * KVBlockSize
+             # blk = blk_cur
+@@ -725,15 +720,20 @@
+         mfma_q = gl.convert_layout(q, mfma_layout_a)
+ 
+         context_kv_idx_next_0 = tl.where(mask_kv_next_0, context_kv_idx_next_0, 0)
+-        k_next_0 = gl.amd.cdna3.buffer_load(
+-            ptr=KV_buffer,
+-            offsets=offset_k_fixed + context_kv_idx_next_0[None, :] * stride_k_seq,
+-        )
+-        k_scale_f_next_0 = gl.amd.cdna3.buffer_load(
+-            ptr=scale_buffer,
+-            offsets=context_kv_idx_next_0 * stride_scale_seq
+-            + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout_b))
+-            % KVBlockSize,
++        k_next_0 = gl.load(
++            KV_buffer
++            + context_kv_idx_next_0[None, :].to(tl.int64) * stride_k_seq
++            + offset_k_fixed.to(tl.int64)
++        )
++        k_scale_f_next_0 = gl.load(
++            scale_buffer
++            + context_kv_idx_next_0.to(tl.int64) * stride_scale_seq
++            + (
++                gl.arange(
++                    0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout_b)
++                )
++                % KVBlockSize
++            ).to(tl.int64)
+         )
+ 
+         _amd_iglp_sched_group_barrier(DS_READ, 4, 0)
+@@ -767,15 +767,20 @@
+         #!=----------------------------
+ 
+         context_kv_idx_next_1 = tl.where(mask_kv_next_1, context_kv_idx_next_1, 0)
+-        k_next_1 = gl.amd.cdna3.buffer_load(
+-            ptr=KV_buffer,
+-            offsets=offset_k_fixed + context_kv_idx_next_1[None, :] * stride_k_seq,
+-        )
+-        k_scale_f_next_1 = gl.amd.cdna3.buffer_load(
+-            ptr=scale_buffer,
+-            offsets=context_kv_idx_next_1 * stride_scale_seq
+-            + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout_b))
+-            % KVBlockSize,
++        k_next_1 = gl.load(
++            KV_buffer
++            + context_kv_idx_next_1[None, :].to(tl.int64) * stride_k_seq
++            + offset_k_fixed.to(tl.int64)
++        )
++        k_scale_f_next_1 = gl.load(
++            scale_buffer
++            + context_kv_idx_next_1.to(tl.int64) * stride_scale_seq
++            + (
++                gl.arange(
++                    0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout_b)
++                )
++                % KVBlockSize
++            ).to(tl.int64)
+         )
+ 
+         _amd_s_set_prio(3)
+@@ -834,15 +839,20 @@
+                 + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout_b))
+                 // KVBlockSize,
+             )
+-            k_next_0 = gl.amd.cdna3.buffer_load(
+-                ptr=KV_buffer,
+-                offsets=offset_k_fixed + context_kv_idx_next_0[None, :] * stride_k_seq,
+-            )
+-            k_scale_f_next_0 = gl.amd.cdna3.buffer_load(
+-                ptr=scale_buffer,
+-                offsets=context_kv_idx_next_0 * stride_scale_seq
+-                + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout_b))
+-                % KVBlockSize,
++            k_next_0 = gl.load(
++                KV_buffer
++                + context_kv_idx_next_0[None, :].to(tl.int64) * stride_k_seq
++                + offset_k_fixed.to(tl.int64)
++            )
++            k_scale_f_next_0 = gl.load(
++                scale_buffer
++                + context_kv_idx_next_0.to(tl.int64) * stride_scale_seq
++                + (
++                    gl.arange(
++                        0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout_b)
++                    )
++                    % KVBlockSize
++                ).to(tl.int64)
+             )
+ 
+             _amd_s_set_prio(3)
+@@ -905,15 +915,20 @@
+                     )
+                     // KVBlockSize,
+                 )
+-            k_next_1 = gl.amd.cdna3.buffer_load(
+-                ptr=KV_buffer,
+-                offsets=offset_k_fixed + context_kv_idx_next_1[None, :] * stride_k_seq,
+-            )
+-            k_scale_f_next_1 = gl.amd.cdna3.buffer_load(
+-                ptr=scale_buffer,
+-                offsets=context_kv_idx_next_1 * stride_scale_seq
+-                + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout_b))
+-                % KVBlockSize,
++            k_next_1 = gl.load(
++                KV_buffer
++                + context_kv_idx_next_1[None, :].to(tl.int64) * stride_k_seq
++                + offset_k_fixed.to(tl.int64)
++            )
++            k_scale_f_next_1 = gl.load(
++                scale_buffer
++                + context_kv_idx_next_1.to(tl.int64) * stride_scale_seq
++                + (
++                    gl.arange(
++                        0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout_b)
++                    )
++                    % KVBlockSize
++                ).to(tl.int64)
+             )
+             _amd_s_set_prio(2)
+             mfma_k = gl.convert_layout(k, mfma_layout_b)
+@@ -1574,15 +1589,20 @@
+         mfma_q = gl.convert_layout(q, mfma_layout_a)
+ 
+         context_kv_idx_next_0 = tl.where(mask_kv_next_0, context_kv_idx_next_0, 0)
+-        k_next_0 = gl.amd.cdna3.buffer_load(
+-            ptr=KV_buffer,
+-            offsets=offset_k_fixed + context_kv_idx_next_0[None, :] * stride_k_seq,
+-        )
+-        k_scale_f_next_0 = gl.amd.cdna3.buffer_load(
+-            ptr=scale_buffer,
+-            offsets=context_kv_idx_next_0 * stride_scale_seq
+-            + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout_b))
+-            % KVBlockSize,
++        k_next_0 = gl.load(
++            KV_buffer
++            + context_kv_idx_next_0[None, :].to(tl.int64) * stride_k_seq
++            + offset_k_fixed.to(tl.int64)
++        )
++        k_scale_f_next_0 = gl.load(
++            scale_buffer
++            + context_kv_idx_next_0.to(tl.int64) * stride_scale_seq
++            + (
++                gl.arange(
++                    0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout_b)
++                )
++                % KVBlockSize
++            ).to(tl.int64)
+         )
+ 
+         _amd_iglp_sched_group_barrier(DS_READ, 4, 0)
+@@ -1616,15 +1636,20 @@
+         #!=----------------------------
+ 
+         context_kv_idx_next_1 = tl.where(mask_kv_next_1, context_kv_idx_next_1, 0)
+-        k_next_1 = gl.amd.cdna3.buffer_load(
+-            ptr=KV_buffer,
+-            offsets=offset_k_fixed + context_kv_idx_next_1[None, :] * stride_k_seq,
+-        )
+-        k_scale_f_next_1 = gl.amd.cdna3.buffer_load(
+-            ptr=scale_buffer,
+-            offsets=context_kv_idx_next_1 * stride_scale_seq
+-            + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout_b))
+-            % KVBlockSize,
++        k_next_1 = gl.load(
++            KV_buffer
++            + context_kv_idx_next_1[None, :].to(tl.int64) * stride_k_seq
++            + offset_k_fixed.to(tl.int64)
++        )
++        k_scale_f_next_1 = gl.load(
++            scale_buffer
++            + context_kv_idx_next_1.to(tl.int64) * stride_scale_seq
++            + (
++                gl.arange(
++                    0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout_b)
++                )
++                % KVBlockSize
++            ).to(tl.int64)
+         )
+ 
+         _amd_s_set_prio(3)
+@@ -1683,15 +1708,20 @@
+                 + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout_b))
+                 // KVBlockSize,
+             )
+-            k_next_0 = gl.amd.cdna3.buffer_load(
+-                ptr=KV_buffer,
+-                offsets=offset_k_fixed + context_kv_idx_next_0[None, :] * stride_k_seq,
+-            )
+-            k_scale_f_next_0 = gl.amd.cdna3.buffer_load(
+-                ptr=scale_buffer,
+-                offsets=context_kv_idx_next_0 * stride_scale_seq
+-                + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout_b))
+-                % KVBlockSize,
++            k_next_0 = gl.load(
++                KV_buffer
++                + context_kv_idx_next_0[None, :].to(tl.int64) * stride_k_seq
++                + offset_k_fixed.to(tl.int64)
++            )
++            k_scale_f_next_0 = gl.load(
++                scale_buffer
++                + context_kv_idx_next_0.to(tl.int64) * stride_scale_seq
++                + (
++                    gl.arange(
++                        0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout_b)
++                    )
++                    % KVBlockSize
++                ).to(tl.int64)
+             )
+ 
+             _amd_s_set_prio(3)
+@@ -1754,15 +1784,20 @@
+                     )
+                     // KVBlockSize,
+                 )
+-            k_next_1 = gl.amd.cdna3.buffer_load(
+-                ptr=KV_buffer,
+-                offsets=offset_k_fixed + context_kv_idx_next_1[None, :] * stride_k_seq,
+-            )
+-            k_scale_f_next_1 = gl.amd.cdna3.buffer_load(
+-                ptr=scale_buffer,
+-                offsets=context_kv_idx_next_1 * stride_scale_seq
+-                + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout_b))
+-                % KVBlockSize,
++            k_next_1 = gl.load(
++                KV_buffer
++                + context_kv_idx_next_1[None, :].to(tl.int64) * stride_k_seq
++                + offset_k_fixed.to(tl.int64)
++            )
++            k_scale_f_next_1 = gl.load(
++                scale_buffer
++                + context_kv_idx_next_1.to(tl.int64) * stride_scale_seq
++                + (
++                    gl.arange(
++                        0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout_b)
++                    )
++                    % KVBlockSize
++                ).to(tl.int64)
+             )
+             _amd_s_set_prio(2)
+             mfma_k = gl.convert_layout(k, mfma_layout_b)
