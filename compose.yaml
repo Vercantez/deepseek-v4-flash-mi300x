@@ -65,7 +65,7 @@ services:
       - --max-model-len
       - "262144"
       - --kv-cache-memory-bytes
-      - "20000000000"
+      - "26000000000"
       - --kv-offloading-size
       - "96"
       - --kv-offloading-backend
@@ -81,7 +81,7 @@ services:
       - --linear-backend
       - auto
       - --speculative-config.method=dspark
-      - --speculative-config.num-speculative-tokens=7
+      - --speculative-config.num-speculative-tokens=5
       - --speculative-config.draft-sample-method=probabilistic
       - --speculative-config.rejection-sample-method=block
     healthcheck:
