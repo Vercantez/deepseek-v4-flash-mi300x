@@ -14,6 +14,7 @@ services:
       - /dev/kfd:/dev/kfd
       - /dev/dri:/dev/dri
     environment:
+      PYTHONHASHSEED: "0"
       VLLM_ROCM_USE_AITER: "1"
       VLLM_ROCM_USE_SKINNY_GEMM: "0"
       HSA_COREDUMP_PATTERN: /var/crash/vllm/gpucore.%p
@@ -22,6 +23,7 @@ services:
       - /root/.cache/huggingface:/root/.cache/huggingface:ro
       - ./aiter-cache:/root/.aiter
       - ./crash-dumps:/var/crash/vllm
+      - /var/lib/vllm-kv:/var/cache/vllm-kv
       - ./vllm-entrypoint.sh:/opt/vllm-entrypoint.sh:ro
       - ./tuning/dsv4-mi300x-a8w8-blockscale-bpreshuffle-ck.prefill-m2688.csv:/opt/aiter-configs/dsv4-mi300x-a8w8-blockscale-bpreshuffle.csv:ro
       - ./tuning/dsv4-a8w8-blockscale-tuned-gemm.mi300x.prefill-m2688.csv:/usr/local/lib/python3.12/dist-packages/aiter/configs/model_configs/dsv4_a8w8_blockscale_tuned_gemm.csv:ro
@@ -38,6 +40,8 @@ services:
       - ./patches/spec-decode-utils.independent-draft-gumbel.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/spec_decode/utils.py:ro
       # Fence native CPU KV transfers behind in-flight compute (vLLM #47282 / PR #47291).
       - ./patches/kv_offload_cpu_gpu_worker.load-war.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/kv_offload/cpu/gpu_worker.py:ro
+      # Keep reusable target-model KV hits when DSpark's ephemeral draft group misses (vLLM #47890 / PR #47891).
+      - ./patches/offloading-scheduler.dspark-prefix.py:/usr/local/lib/python3.12/dist-packages/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py:ro
     entrypoint: [/opt/vllm-entrypoint.sh]
     command:
       - /root/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash-0731/snapshots/7872f01b1d1fe23eabc4c98b48bffcef5a386062
@@ -70,6 +74,8 @@ services:
       - "96"
       - --kv-offloading-backend
       - native
+      - --kv-transfer-config
+      - '{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"spec_name":"TieringOffloadingSpec","secondary_tiers":[{"type":"fs","root_dir":"/var/cache/vllm-kv","n_read_threads":16,"n_write_threads":16,"locality":"LOCAL"}]}}'
       - --max-num-seqs
       - "64"
       - --max-num-batched-tokens
