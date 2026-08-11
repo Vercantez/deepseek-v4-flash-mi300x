@@ -81,7 +81,7 @@ services:
       - --max-num-batched-tokens
       - "2048"
       - --long-prefill-token-threshold
-      - "1024"
+      - "2048"
       - --moe-backend
       - triton
       - --linear-backend
