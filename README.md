@@ -34,9 +34,9 @@ MI300X (CDNA3) implements the AMD/Graphcore `fnuz` variant of E4M3, while MI325X
 This repository adds:
 
 1. **Correctness overlays** for the pinned ROCm nightly, including fixes not yet in upstream vLLM.
-2. **A validated serving configuration** with probabilistic DSpark drafting, block rejection, and static K=7. It uses a 2,048-token scheduler budget and a 1,024-token long-prefill cap to prevent a cold prompt from stalling other streams.
+2. **A validated serving configuration** with probabilistic DSpark drafting, block rejection, and static K=5. It uses a 2,048-token scheduler budget and a 2,048-token long-prefill cap.
 3. **AITER GEMM tuning tables** for the recurring `gfx942` shapes the packaged tables were missing, plus a `gfx942` OGS geometry override for the MXFP4 experts.
-4. **A hybrid KV strategy**: 20 GB of `fp8_ds_mla` GPU cache + 96 GiB native CPU offload, with a load-path fencing fix that upstream [issue #47282](https://github.com/vllm-project/vllm/issues/47282) documents but [PR #47291](https://github.com/vllm-project/vllm/pull/47291) never merged.
+4. **A hybrid KV strategy**: 26 GB of `fp8_ds_mla` GPU cache + 96 GiB native CPU offload + a persistent filesystem tier, with load-path and DSpark prefix fixes carried as overlays.
 
 ## Repository layout
 
@@ -61,7 +61,9 @@ The stack uses a digest-pinned official vLLM ROCm nightly with:
 - `--trust-remote-code` and the DeepSeek V4 tokenizer, reasoning, and tool parsers
 - `fp8_ds_mla` KV cache (UE8M0 block-scaled FP8, not generic unscaled FP8) with 256-token blocks
 - `VLLM_ROCM_USE_AITER=1` and `--moe-backend triton`; Triton OGS handles the grouped MXFP4 experts, while AITER handles attention and dense linear layers
-- DSpark-7 speculative decoding with probabilistic drafting and block rejection
+- DSpark-5 speculative decoding with probabilistic drafting and block rejection
+- constrained DeepSeek V4 DSML generation plus recovery for missing outer tool-call wrappers
+- persistent filesystem KV offload behind the native 96 GiB CPU tier
 - full/breakable CUDA graph capture, giving one graph launch per token during steady decode
 - Caddy as an IP-allowlisted HTTPS proxy
 
@@ -142,6 +144,9 @@ Each `patches/*.py` file is a **full-file overlay** mounted read-only over its c
 | `rocm_aiter_mla.dspark-causal.py` | `vllm/v1/attention/backends/mla/rocm_aiter_mla.py` | Causal multi-token speculative verification | Required for DSpark on ROCm small-head MLA — now [upstream](https://github.com/vllm-project/vllm/commit/77469c9057bec3212a64877dbbf3b9c48c22d786); the overlay is the upstream file verbatim |
 | `dspark-speculator.independent-draft-gumbel.py` + `spec-decode-utils.independent-draft-gumbel.py` | `vllm/v1/worker/gpu/spec_decode/dspark/speculator.py` + `.../spec_decode/utils.py` | Draft-proposal Gumbel noise salted away from rejection/recovery noise | Required only with `draft_sample_method=probabilistic` (the recipe's greedy path does not need it) |
 | `kv_offload_cpu_gpu_worker.load-war.py` | `vllm/v1/kv_offload/cpu/gpu_worker.py` | Fence CPU→GPU KV restores behind in-flight compute ([#47282](https://github.com/vllm-project/vllm/issues/47282), [PR #47291](https://github.com/vllm-project/vllm/pull/47291)) | Required only with `--kv-offloading-backend native` |
+| `offloading-scheduler.dspark-prefix.py` | `vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py` | Exclude DSpark's ephemeral draft group from reusable prefix lookup/load | Required with DSpark + native/tiered KV offload; based on [#47890](https://github.com/vllm-project/vllm/issues/47890) / [#47891](https://github.com/vllm-project/vllm/pull/47891) |
+| `structural-tag-registry.deepseek-v4-auto.py` | `vllm/tool_parsers/structural_tag_registry.py` | Keep triggered DSML grammar enabled for `tool_choice=auto` + non-strict tools | Required for reliable OpenCode-style tool calls; based on [#40801](https://github.com/vllm-project/vllm/issues/40801) / [#46632](https://github.com/vllm-project/vllm/pull/46632) |
+| `parser-*.dsml-orphan.py` + `tool-parser-utils.dsml-orphan.py` | `vllm/parser/...` + `vllm/tool_parsers/utils.py` | Recover declared DSML invokes when the model omits the outer `tool_calls` wrapper | Required for long-context agent sessions; backported from [#49117](https://github.com/vllm-project/vllm/pull/49117) |
 
 ### Two important correctness fixes
 
@@ -162,9 +167,9 @@ Key optimizations in the production configuration:
 | Tune 21 recurring A8W8 GEMM shapes for 304-CU `gfx942` | +42–62% single/double-stream decode; +10–35% at 8–64 streams |
 | Fused SiLU, fast DeepSeek routing, batch-sensitive expert tiles | Native C1 decode 34.5 → 56.6 tok/s (+64%); routing kernel 42.6 → 11.9 µs/layer |
 | `BLOCK_H=64` sparse-prefill tile | Prefill reaches 7.9–8.5K tok/s; sparse-attention trace 317 → 142 ms per request |
-| Static K=7, probabilistic + block rejection, causal verify | 119.5 tok/s single-stream with correct output |
-| 2,048-token budget + 1,024-token long-prefill cap | Late short-request TTFT behind a 52K prefill: **8.2 s → 0.5 s** |
-| 20 GB GPU KV + 96 GiB CPU tier | 1.93M-token length-equivalent capacity; seven 256K requests admitted |
+| Static K=5, probabilistic + block rejection, causal verify | Production latency/acceptance tradeoff |
+| 2,048-token budget + 2,048-token long-prefill cap | Larger prefill slices while retaining scheduler interleaving |
+| 26 GB GPU KV + 96 GiB CPU + filesystem tier | 2.51M GPU-KV tokens plus persistent prefix spill |
 
 ### Final concurrency sweep
 
@@ -182,13 +187,13 @@ DSpark acceptance is prompt-dependent; treat these as gates for this exact image
 
 ### Prefill
 
-With the tuned kernels, uncached prefill reaches **7.9–8.5K tok/s**, depending on scheduler budget: 7.90–7.99K at C1 with an 8,192-token budget and 8.46–8.51K at C4. The production profile uses a 2,048-token budget for latency isolation, giving 6,988–7,019 tok/s on fresh prompts. With the 1,024-token long-prefill cap, an 8.9K-token prompt reaches 5.20–5.29K tok/s at C1. In exchange, TTFT for a short request queued behind a 52K cold prefill drops from 8.2 s to 0.5 s. Warm recall of 380K cached tokens takes 0.64–2.65 s after a 120–125 s cold prefill.
+With the tuned kernels, uncached prefill reaches **7.9–8.5K tok/s**, depending on scheduler budget: 7.90–7.99K at C1 with an 8,192-token budget and 8.46–8.51K at C4. The production profile uses a 2,048-token budget and a 2,048-token long-prefill cap. Earlier 1,024-token-cap testing reached 5.20–5.29K tok/s for an 8.9K-token prompt while reducing a short request's TTFT behind a 52K cold prefill from 8.2 s to 0.5 s. Warm recall of 380K cached tokens takes 0.64–2.65 s after a 120–125 s cold prefill.
 
 ## Production notes
 
 - **HBM headroom is limited.** The warmed high-water mark is 204.5 of 205.8 GB. A 30 GB KV pool loads but fails during graph capture with `HSA_STATUS_ERROR_OUT_OF_RESOURCES`. Do not raise `--kv-cache-memory-bytes`; monitor HBM usage for growth.
-- **The CPU KV tier stores cache entries, not weights.** `--kv-offloading-size 96 --kv-offloading-backend native` maps ~103 GB in `/dev/shm` for evicted prefix-cache entries. The entrypoint removes stale mappings after crashes.
-- **The 1,664-token scheduler warning is expected.** DSpark-7 reserves draft slots from the 2,048-token budget. Raising the budget reserves more in-flight sliding-window state and reduces usable KV capacity.
+- **The offload tiers store cache entries, not weights.** `--kv-offloading-size 96 --kv-offloading-backend native` maps ~103 GB in `/dev/shm`; the configured filesystem tier persists colder prefixes under `/var/cache/vllm-kv`. The entrypoint removes stale CPU mmap files after crashes.
+- **The 1,792-token scheduler warning is expected.** DSpark-5 reserves draft slots from the 2,048-token budget. Raising the budget reserves more in-flight sliding-window state and reduces usable KV capacity.
 - **Warm the kernels after restart.** The first prefill initializes kernels and takes 5.3 s for 8.9K tokens; subsequent runs take 1.7 s. Run one uncached prefill before admitting traffic.
 - **Test correctness as well as throughput.** The validation suite includes two-turn tool-calling fixtures, a BFCL subset (74–76/90 exact calls), OpenCode tool-schema checks, and 380K-token needle recall on both native and DSpark paths. Cold and cached prefills can take different floating-point paths, so test both.
 

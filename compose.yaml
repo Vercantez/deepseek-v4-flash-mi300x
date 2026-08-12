@@ -42,6 +42,15 @@ services:
       - ./patches/kv_offload_cpu_gpu_worker.load-war.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/kv_offload/cpu/gpu_worker.py:ro
       # Keep reusable target-model KV hits when DSpark's ephemeral draft group misses (vLLM #47890 / PR #47891).
       - ./patches/offloading-scheduler.dspark-prefix.py:/usr/local/lib/python3.12/dist-packages/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py:ro
+      # Keep DeepSeek V4 DSML constrained for auto + non-strict tools (vLLM #40801 / PR #46632).
+      - ./patches/structural-tag-registry.deepseek-v4-auto.py:/usr/local/lib/python3.12/dist-packages/vllm/tool_parsers/structural_tag_registry.py:ro
+      # Recover declared DSML tool calls when the model omits the outer tool_calls wrapper (vLLM PR #49117).
+      - ./patches/parser-deepseek-v32.dsml-orphan.py:/usr/local/lib/python3.12/dist-packages/vllm/parser/deepseek_v32.py:ro
+      - ./patches/parser-deepseek-v4.dsml-orphan.py:/usr/local/lib/python3.12/dist-packages/vllm/parser/deepseek_v4.py:ro
+      - ./patches/parser-engine.dsml-orphan.py:/usr/local/lib/python3.12/dist-packages/vllm/parser/engine/parser_engine.py:ro
+      - ./patches/parser-engine-config.dsml-orphan.py:/usr/local/lib/python3.12/dist-packages/vllm/parser/engine/parser_engine_config.py:ro
+      - ./patches/streaming-parser-engine.dsml-orphan.py:/usr/local/lib/python3.12/dist-packages/vllm/parser/engine/streaming_parser_engine.py:ro
+      - ./patches/tool-parser-utils.dsml-orphan.py:/usr/local/lib/python3.12/dist-packages/vllm/tool_parsers/utils.py:ro
     entrypoint: [/opt/vllm-entrypoint.sh]
     command:
       - /root/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash-0731/snapshots/7872f01b1d1fe23eabc4c98b48bffcef5a386062

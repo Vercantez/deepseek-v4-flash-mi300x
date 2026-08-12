@@ -1,0 +1,21 @@
+diff --git a/vllm/tool_parsers/structural_tag_registry.py b/vllm/tool_parsers/structural_tag_registry.py
+index 3423fd304b..f781bea03c 100644
+--- a/vllm/tool_parsers/structural_tag_registry.py
++++ b/vllm/tool_parsers/structural_tag_registry.py
+@@ -111,7 +111,15 @@ def get_model_structural_tag(
+     if not tools or tool_choice == "none":
+         return None
+
+-    if tool_choice == "auto" and not _any_tool_strict(tools):
++    # DeepSeek V4's triggered structural tag permits ordinary text, but once
++    # DSML starts it constrains the model to a well-formed tool call. Keep it
++    # enabled for the common OpenAI-compatible auto + non-strict tools case;
++    # otherwise malformed DSML can leak through as assistant content.
++    if (
++        model != "deepseek_v4"
++        and tool_choice == "auto"
++        and not _any_tool_strict(tools)
++    ):
+         return None
+
+     dumped_tools = [_dump_tool_for_xgrammar(tool) for tool in tools]
