@@ -105,8 +105,8 @@ CONFIGS = {
 }
 
 SMALL_CONFIGS = {
-    "production_small": flags(16, 32, 256, 2, 0),
-    "bn64_small": flags(16, 64, 256, 2, 0),
+    "production_small": flags(16, 64, 256, 2, 0),
+    "previous_bn32_small": flags(16, 32, 256, 2, 0),
     "bn128_small": flags(16, 128, 256, 2, 0),
     "bk128_small": flags(16, 32, 128, 2, 0),
     "warps4_small": flags(16, 32, 256, 4, 0),
