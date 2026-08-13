@@ -104,6 +104,17 @@ CONFIGS = {
     "waves3": flags(16, 128, 256, 4, 3),
 }
 
+SMALL_CONFIGS = {
+    "production_small": flags(16, 32, 256, 2, 0),
+    "bn64_small": flags(16, 64, 256, 2, 0),
+    "bn128_small": flags(16, 128, 256, 2, 0),
+    "bk128_small": flags(16, 32, 128, 2, 0),
+    "warps4_small": flags(16, 32, 256, 4, 0),
+    "warps8_small": flags(16, 32, 256, 8, 0),
+    "waves1_small": flags(16, 32, 256, 2, 1),
+    "waves2_small": flags(16, 32, 256, 2, 2),
+}
+
 
 def timed(fn, warmup: int, repetitions: int):
     for _ in range(warmup):
@@ -184,7 +195,8 @@ def main():
     )
 
     reference = None
-    for name, config in CONFIGS.items():
+    configs = SMALL_CONFIGS if args.batch <= 12 else CONFIGS
+    for name, config in configs.items():
         try:
             reset_opt_flags()
             set_opt_flags(config)
