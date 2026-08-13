@@ -9,10 +9,8 @@ python3 /opt/apply-deepseek-v4-reasoning-effort.py
 if [ -n "${VLLM_PROFILE_DIR:-}" ]; then
     mkdir -p "$VLLM_PROFILE_DIR"
     set -- "$@" \
-        --profiler-config.profiler=torch \
-        --profiler-config.torch_profiler_dir="$VLLM_PROFILE_DIR" \
-        --profiler-config.torch_profiler_with_stack=false \
-        --profiler-config.torch_profiler_record_shapes=true
+        --profiler-config \
+        "{\"profiler\":\"torch\",\"torch_profiler_dir\":\"$VLLM_PROFILE_DIR\",\"torch_profiler_with_stack\":false,\"torch_profiler_record_shapes\":true}"
 fi
 
 exec vllm serve "$@"
