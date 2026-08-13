@@ -33,7 +33,7 @@
  ded4e60292502d401a57332b0c661f874a8af4f34c1dd7451b66891b80c60af1  patches/diffs/11-structural-tag-registry.deepseek-v4-auto.patch
  c63a700f16291b0648489c309dbcb2aa2aaa901aa774c22486822ba1c274af4d  patches/diffs/12-deepseek-dsml-orphan-recovery.patch
  f976592aca40adb6a649767188a96b55432ea3c36a8ffc5971005b72ef9da748  patches/diffs/13-tiering-fs-manager.disk-reserve.patch
- 8285c5e697540cd6ed53058ae5fe273435a23ce8f672a0658fc71ce2a8982528  scripts/prune-vllm-kv-cache.sh
+ 34d78256aa4d3c39e704ba81f6c23c415b15560209afc3f132f5d15fab99d7a2  scripts/prune-vllm-kv-cache.sh
  7934699f3edd3c9473ad079f11b22937439f34c9edb8e2f32044b30cde7ed615  systemd/vllm-kv-cache-prune.service
  0e0e4b8cee28364015611d8161c03f2330a6ea76dede0ff86cbf1007d5f4530d  systemd/vllm-kv-cache-prune.timer
  579eabf2e06fd8d80c7919abbbe66deeddc53a4ba9ae47c263f4ffff6c7575c8  tuning/dsv4-a8w8-blockscale-tuned-gemm.mi300x.prefill-m2688.csv

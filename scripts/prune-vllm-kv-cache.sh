@@ -20,7 +20,7 @@ flock -n 9 || exit 0
 gib=$((1024 * 1024 * 1024))
 trigger_bytes=$((TRIGGER_FREE_GIB * gib))
 target_bytes=$((TARGET_FREE_GIB * gib))
-available_bytes=$(df -PB1 --output=avail "$CACHE_ROOT" | tail -1 | tr -d ' ')
+available_bytes=$(df -B1 --output=avail "$CACHE_ROOT" | tail -1 | tr -d ' ')
 if [ "$available_bytes" -ge "$trigger_bytes" ]; then
   exit 0
 fi
@@ -39,7 +39,7 @@ find "$CACHE_ROOT" -mindepth 2 -maxdepth 2 -type d -printf '%T@ %p\n' \
       rm -rf -- "$shard"
       deleted=$((deleted + 1))
       if [ $((deleted % BATCH_SHARDS)) -eq 0 ]; then
-        available_bytes=$(df -PB1 --output=avail "$CACHE_ROOT" | tail -1 | tr -d ' ')
+        available_bytes=$(df -B1 --output=avail "$CACHE_ROOT" | tail -1 | tr -d ' ')
         if [ "$available_bytes" -ge "$target_bytes" ]; then
           logger -t vllm-kv-prune "Pruned $deleted shards; KV filesystem now has $((available_bytes / gib)) GiB free"
           exit 0
