@@ -76,6 +76,7 @@ services:
       - deepseek_v4
       - --enable-auto-tool-choice
       - --enable-prompt-tokens-details
+      - --enable-per-request-metrics
       - --kv-cache-dtype
       - fp8
       - --block-size
