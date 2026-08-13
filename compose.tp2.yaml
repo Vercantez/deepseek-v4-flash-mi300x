@@ -5,6 +5,11 @@ services:
   inference:
     container_name: deepseek-v4-flash-0731-dspark-mi300x
     network_mode: host
+    environment:
+      HIP_VISIBLE_DEVICES: "0,1"
+      ROCR_VISIBLE_DEVICES: "0,1"
+      HIP_FORCE_DEV_KERNARG: "1"
+      HSA_OVERRIDE_CPU_AFFINITY_DEBUG: "0"
     command:
       - /root/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash-0731/snapshots/7872f01b1d1fe23eabc4c98b48bffcef5a386062
       - --host
