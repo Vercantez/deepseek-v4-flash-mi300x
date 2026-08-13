@@ -106,6 +106,11 @@ class GroupOffloadConfig(NamedTuple):
     # has no request-independent reuse value. A miss in that group must not
     # veto independently confirmed hits in the target model's KV groups.
     eagle_group_is_veto_exempt: bool = False
+    # DSpark rebuilds its draft context from target-model hidden states. Never
+    # look up, load, touch, or store this ephemeral group in external tiers:
+    # partial/stale draft-group hits can otherwise select keys that are absent
+    # from a lower tier and make prepare_load fail the whole engine.
+    skip_external_reuse: bool = False
 
 
 def get_sliding_window_size_in_chunks(
@@ -233,6 +238,12 @@ class SchedulerOffloadConfig(NamedTuple):
                 "excluded from offloading due to volatility.",
                 sorted(eagle_groups),
             )
+        if use_dspark and eagle_groups:
+            logger.info(
+                "KV offloading: DSpark ephemeral draft attention groups %s "
+                "will be excluded from external lookup, load, touch, and store.",
+                sorted(eagle_groups),
+            )
 
         return cls(
             num_workers=vllm_config.parallel_config.world_size,
@@ -259,6 +270,7 @@ class SchedulerOffloadConfig(NamedTuple):
                     ),
                     is_eagle_group=idx in eagle_groups,
                     eagle_group_is_veto_exempt=(use_dspark and idx in eagle_groups),
+                    skip_external_reuse=(use_dspark and idx in eagle_groups),
                 )
                 for idx, tokens_per_block in enumerate(spec.tokens_per_block)
             ),
@@ -626,6 +638,8 @@ class OffloadingConnectorScheduler:
         for group_config, group_state in zip(
             self.config.kv_group_configs, req_status.group_states
         ):
+            if group_config.skip_external_reuse:
+                continue
             if group_config.sliding_window_size_in_chunks is None:
                 self.manager.touch(group_state.offload_keys, req_status.req_context)
             else:
@@ -665,14 +679,25 @@ class OffloadingConnectorScheduler:
 
         num_hit_tokens: int = 0
         defer_lookup = False
-        lookup_groups = self._lookup_groups
+        excluded_groups = {
+            group_config.group_idx
+            for group_config in self.config.kv_group_configs
+            if group_config.skip_external_reuse
+        }
+        lookup_groups = tuple(
+            group_idx
+            for group_idx in self._lookup_groups
+            if group_idx not in excluded_groups
+        )
 
         # Tracks which eagle groups have already popped their volatile trailing chunk
         # in the current convergence iteration. Reset when a non-eagle group
         # tightens the hit boundary, requiring a fresh pop.
         eagle_verified: set[int] = set()
-        excluded_groups: set[int] = set()
-        req_status.lookup_excluded_groups = frozenset()
+        # Publish this before lookup because several valid miss paths return
+        # early. update_state_after_alloc must never schedule loads for the
+        # DSpark group, even when the reusable groups miss.
+        req_status.lookup_excluded_groups = frozenset(excluded_groups)
         while lookup_groups:
             looked_up_sliding_window: bool = False
             groups_iter = iter(lookup_groups)
@@ -1088,6 +1113,8 @@ class OffloadingConnectorScheduler:
             for group_config, group_state in zip(
                 self.config.kv_group_configs, req_status.group_states
             ):
+                if group_config.skip_external_reuse:
+                    continue
                 num_chunks = req_status.storable_chunks(
                     group_config, group_state, num_offloadable_tokens
                 )
