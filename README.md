@@ -36,7 +36,7 @@ This repository adds:
 1. **Correctness overlays** for the pinned ROCm nightly, including fixes not yet in upstream vLLM.
 2. **A validated serving configuration** with probabilistic DSpark drafting, block rejection, and static K=5. It uses a 2,048-token scheduler budget and a 2,048-token long-prefill cap.
 3. **AITER GEMM tuning tables** for the recurring `gfx942` shapes the packaged tables were missing, plus a `gfx942` OGS geometry override for the MXFP4 experts.
-4. **A bounded hybrid KV strategy**: 26 GB of `fp8_ds_mla` GPU cache + 96 GiB native CPU offload + a persistent filesystem tier, with load-path and DSpark prefix fixes carried as overlays. The disk tier stops admitting writes with less than 2 TiB free, and a host timer prunes cache shards back to 3 TiB free.
+4. **A bounded hybrid KV strategy**: 26 GB of `fp8_ds_mla` GPU cache + 96 GiB native CPU offload + a persistent filesystem tier, with load-path and DSpark prefix fixes carried as overlays. Filesystem eviction is owned by vLLM: active requests and transfers lease their hash shards, the tier retires only idle LRU shards, and a 2 TiB hard reserve keeps inference alive if deletion cannot keep up.
 
 ## Repository layout
 
@@ -50,8 +50,7 @@ This repository adds:
 │   ├── *.py            # Byte-for-byte production overlays (mounted read-only)
 │   ├── diffs/*.patch   # Unified diffs vs. the upstream base revision
 │   └── README.md       # Provenance and regeneration instructions
-├── scripts/             # Host-side bounded disk-cache maintenance
-├── systemd/             # Timer and service for disk-cache pruning
+├── tests/               # Concurrency and atomic-eviction tests
 └── tuning/
     └── *.csv           # AITER A8W8 blockscale tuning tables for gfx942
 ```
@@ -97,10 +96,6 @@ chmod +x vllm-entrypoint.sh
 sha256sum -c SHA256SUMS        # verify the overlays before first start
 
 sudo mkdir -p /var/lib/vllm-kv
-sudo install -m 0755 scripts/prune-vllm-kv-cache.sh /usr/local/sbin/prune-vllm-kv-cache
-sudo install -m 0644 systemd/vllm-kv-cache-prune.service systemd/vllm-kv-cache-prune.timer /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now vllm-kv-cache-prune.timer
 ```
 
 ### 4. Start
@@ -153,7 +148,7 @@ Each `patches/*.py` file is a **full-file overlay** mounted read-only over its c
 | `dspark-speculator.independent-draft-gumbel.py` + `spec-decode-utils.independent-draft-gumbel.py` | `vllm/v1/worker/gpu/spec_decode/dspark/speculator.py` + `.../spec_decode/utils.py` | Draft-proposal Gumbel noise salted away from rejection/recovery noise | Required only with `draft_sample_method=probabilistic` (the recipe's greedy path does not need it) |
 | `kv_offload_cpu_gpu_worker.load-war.py` | `vllm/v1/kv_offload/cpu/gpu_worker.py` | Fence CPU→GPU KV restores behind in-flight compute ([#47282](https://github.com/vllm-project/vllm/issues/47282), [PR #47291](https://github.com/vllm-project/vllm/pull/47291)) | Required only with `--kv-offloading-backend native` |
 | `offloading-scheduler.dspark-prefix.py` | `vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py` | Exclude DSpark's ephemeral draft group from reusable prefix lookup/load | Required with DSpark + native/tiered KV offload; based on [#47890](https://github.com/vllm-project/vllm/issues/47890) / [#47891](https://github.com/vllm-project/vllm/pull/47891) |
-| `tiering-fs-manager.disk-reserve.py` | `vllm/v1/kv_offload/tiering/fs/manager.py` | Reject new filesystem-tier stores before they consume the OS disk reserve; loads and inference continue | Required with the filesystem tier until upstream implements bounded capacity/eviction |
+| `tiering-fs-bounded-lru.py` + `tiering-fs-manager.disk-reserve.py` | `vllm/v1/kv_offload/tiering/fs/bounded_lru.py` + `.../fs/manager.py` | Lease shards used by requests/transfers, atomically retire only idle LRU shards in the background, and reject new stores before consuming the 2 TiB OS reserve | Required with the filesystem tier until upstream implements bounded secondary-tier eviction |
 | `structural-tag-registry.deepseek-v4-auto.py` | `vllm/tool_parsers/structural_tag_registry.py` | Keep triggered DSML grammar enabled for `tool_choice=auto` + non-strict tools | Required for reliable OpenCode-style tool calls; based on [#40801](https://github.com/vllm-project/vllm/issues/40801) / [#46632](https://github.com/vllm-project/vllm/pull/46632) |
 | `parser-*.dsml-orphan.py` + `tool-parser-utils.dsml-orphan.py` | `vllm/parser/...` + `vllm/tool_parsers/utils.py` | Recover declared DSML invokes when the model omits the outer `tool_calls` wrapper | Required for long-context agent sessions; backported from [#49117](https://github.com/vllm-project/vllm/pull/49117) |
 
@@ -201,7 +196,7 @@ With the tuned kernels, uncached prefill reaches **7.9–8.5K tok/s**, depending
 ## Production notes
 
 - **HBM headroom is limited.** The warmed high-water mark is 204.5 of 205.8 GB. A 30 GB KV pool loads but fails during graph capture with `HSA_STATUS_ERROR_OUT_OF_RESOURCES`. Do not raise `--kv-cache-memory-bytes`; monitor HBM usage for growth.
-- **The offload tiers store cache entries, not weights.** `--kv-offloading-size 96 --kv-offloading-backend native` maps ~103 GB in `/dev/shm`; the configured filesystem tier persists colder prefixes under `/var/cache/vllm-kv`. Upstream's experimental filesystem tier has no capacity accounting or eviction, so this stack reserves 2 TiB at write admission and runs a five-minute host timer that begins pruning below 2.5 TiB free and stops at 3 TiB. The entrypoint removes stale CPU mmap files after crashes.
+- **The offload tiers store cache entries, not weights.** `--kv-offloading-size 96 --kv-offloading-backend native` maps ~103 GB in `/dev/shm`; the configured filesystem tier persists colder prefixes under `/var/cache/vllm-kv`. Upstream's experimental filesystem tier has no bounded secondary-tier eviction, so this stack begins in-process shard LRU eviction below 2.5 TiB free and stops at 3 TiB. Positive lookups and transfers lease their shards before eviction can begin. If every shard is busy or deletion falls behind, the 2 TiB admission reserve rejects new disk stores while inference and existing loads continue. Never delete files externally while vLLM is running. The entrypoint removes stale CPU mmap files after crashes.
 - **The 1,792-token scheduler warning is expected.** DSpark-5 reserves draft slots from the 2,048-token budget. Raising the budget reserves more in-flight sliding-window state and reduces usable KV capacity.
 - **Warm the kernels after restart.** The first prefill initializes kernels and takes 5.3 s for 8.9K tokens; subsequent runs take 1.7 s. Run one uncached prefill before admitting traffic.
 - **Test correctness as well as throughput.** The validation suite includes two-turn tool-calling fixtures, a BFCL subset (74–76/90 exact calls), OpenCode tool-schema checks, and 380K-token needle recall on both native and DSpark paths. Cold and cached prefills can take different floating-point paths, so test both.

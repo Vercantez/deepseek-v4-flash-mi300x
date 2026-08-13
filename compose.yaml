@@ -42,7 +42,9 @@ services:
       - ./patches/kv_offload_cpu_gpu_worker.load-war.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/kv_offload/cpu/gpu_worker.py:ro
       # Keep reusable target-model KV hits when DSpark's ephemeral draft group misses (vLLM #47890 / PR #47891).
       - ./patches/offloading-scheduler.dspark-prefix.py:/usr/local/lib/python3.12/dist-packages/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py:ro
-      # Preserve 2 TiB of host disk even if the experimental filesystem KV tier stops evicting.
+      # Own filesystem cache admission and LRU eviction inside vLLM so a shard
+      # cannot disappear after a request or transfer has leased it.
+      - ./patches/tiering-fs-bounded-lru.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/kv_offload/tiering/fs/bounded_lru.py:ro
       - ./patches/tiering-fs-manager.disk-reserve.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/kv_offload/tiering/fs/manager.py:ro
       # Keep DeepSeek V4 DSML constrained for auto + non-strict tools (vLLM #40801 / PR #46632).
       - ./patches/structural-tag-registry.deepseek-v4-auto.py:/usr/local/lib/python3.12/dist-packages/vllm/tool_parsers/structural_tag_registry.py:ro
@@ -86,7 +88,7 @@ services:
       - --kv-offloading-backend
       - native
       - --kv-transfer-config
-      - '{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"spec_name":"TieringOffloadingSpec","secondary_tiers":[{"type":"fs","root_dir":"/var/cache/vllm-kv","n_read_threads":16,"n_write_threads":16,"locality":"LOCAL","min_free_gb":2048,"space_check_interval_seconds":1}]}}'
+      - '{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"spec_name":"TieringOffloadingSpec","secondary_tiers":[{"type":"fs","root_dir":"/var/cache/vllm-kv","n_read_threads":16,"n_write_threads":16,"locality":"LOCAL","min_free_gb":2048,"space_check_interval_seconds":1,"eviction_trigger_free_gb":2560,"eviction_target_free_gb":3072,"shard_touch_interval_seconds":30}]}}'
       - --max-num-seqs
       - "64"
       - --max-num-batched-tokens
