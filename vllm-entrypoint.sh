@@ -10,9 +10,9 @@ if [ -n "${VLLM_PROFILE_DIR:-}" ]; then
     mkdir -p "$VLLM_PROFILE_DIR"
     set -- "$@" \
         --profiler-config.profiler=torch \
-        --profiler-config.torch-profiler-dir="$VLLM_PROFILE_DIR" \
-        --profiler-config.torch-profiler-with-stack=false \
-        --profiler-config.torch-profiler-record-shapes=true
+        --profiler-config.torch_profiler_dir="$VLLM_PROFILE_DIR" \
+        --profiler-config.torch_profiler_with_stack=false \
+        --profiler-config.torch_profiler_record_shapes=true
 fi
 
 exec vllm serve "$@"
