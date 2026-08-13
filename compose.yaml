@@ -42,6 +42,8 @@ services:
       - ./patches/kv_offload_cpu_gpu_worker.load-war.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/kv_offload/cpu/gpu_worker.py:ro
       # Keep reusable target-model KV hits when DSpark's ephemeral draft group misses (vLLM #47890 / PR #47891).
       - ./patches/offloading-scheduler.dspark-prefix.py:/usr/local/lib/python3.12/dist-packages/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py:ro
+      # Preserve 2 TiB of host disk even if the experimental filesystem KV tier stops evicting.
+      - ./patches/tiering-fs-manager.disk-reserve.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/kv_offload/tiering/fs/manager.py:ro
       # Keep DeepSeek V4 DSML constrained for auto + non-strict tools (vLLM #40801 / PR #46632).
       - ./patches/structural-tag-registry.deepseek-v4-auto.py:/usr/local/lib/python3.12/dist-packages/vllm/tool_parsers/structural_tag_registry.py:ro
       # Recover declared DSML tool calls when the model omits the outer tool_calls wrapper (vLLM PR #49117).
@@ -84,7 +86,7 @@ services:
       - --kv-offloading-backend
       - native
       - --kv-transfer-config
-      - '{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"spec_name":"TieringOffloadingSpec","secondary_tiers":[{"type":"fs","root_dir":"/var/cache/vllm-kv","n_read_threads":16,"n_write_threads":16,"locality":"LOCAL"}]}}'
+      - '{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"spec_name":"TieringOffloadingSpec","secondary_tiers":[{"type":"fs","root_dir":"/var/cache/vllm-kv","n_read_threads":16,"n_write_threads":16,"locality":"LOCAL","min_free_gb":2048,"space_check_interval_seconds":1}]}}'
       - --max-num-seqs
       - "64"
       - --max-num-batched-tokens

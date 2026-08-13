@@ -1,0 +1,102 @@
+--- a/vllm/v1/kv_offload/tiering/fs/manager.py
++++ b/vllm/v1/kv_offload/tiering/fs/manager.py
+@@ -18,6 +18,8 @@
+ import functools
+ import json
+ import os
++import time
++from collections import deque
+ from collections.abc import Iterable
+ from typing import TYPE_CHECKING, ClassVar
+ 
+@@ -116,6 +118,8 @@
+         n_write_threads: int = 16,
+         enable_kv_events: bool = False,
+         locality: str | None = None,
++        min_free_gb: float = 0,
++        space_check_interval_seconds: float = 1,
+     ):
+         """
+         Args:
+@@ -131,8 +135,24 @@
+                 cache events are enabled globally (kv_events_config).
+             locality: Whether this tier's storage is LOCAL or REMOTE relative
+                 to the publishing vLLM instance.
++            min_free_gb: Stop admitting new disk-cache writes when available
++                filesystem space falls below this many GiB. Loads continue and
++                rejected stores are reported as failed jobs so inference can
++                continue without filling the host filesystem.
++            space_check_interval_seconds: Cache filesystem space checks for at
++                most this many seconds to avoid a statvfs call per KV block.
+         """
+         super().__init__(offloading_spec, primary_kv_view, tier_type)
++        if min_free_gb < 0:
++            raise ValueError("min_free_gb must be non-negative")
++        if space_check_interval_seconds < 0:
++            raise ValueError("space_check_interval_seconds must be non-negative")
++        self._root_dir = root_dir
++        self._min_free_bytes = int(min_free_gb * 1024**3)
++        self._space_check_interval_seconds = space_check_interval_seconds
++        self._last_space_check = 0.0
++        self._space_available = True
++        self._rejected_store_jobs: deque[JobId] = deque()
+         self.locality = Locality(locality) if locality is not None else None
+ 
+         self.events: list[OffloadingEvent] | None = None
+@@ -203,8 +223,37 @@
+             return LookupResult.RETRY
+         return LookupResult.HIT if result else LookupResult.MISS
+ 
++    def _has_store_space(self) -> bool:
++        if self._min_free_bytes == 0:
++            return True
++        now = time.monotonic()
++        if now - self._last_space_check < self._space_check_interval_seconds:
++            return self._space_available
++
++        stats = os.statvfs(self._root_dir)
++        available = stats.f_bavail * stats.f_frsize
++        was_available = self._space_available
++        self._space_available = available >= self._min_free_bytes
++        self._last_space_check = now
++        if was_available and not self._space_available:
++            logger.error(
++                "Pausing filesystem KV-cache stores: %d GiB available is below "
++                "the configured %d GiB reserve. Cache loads and inference continue.",
++                available // 1024**3,
++                self._min_free_bytes // 1024**3,
++            )
++        elif not was_available and self._space_available:
++            logger.info(
++                "Resuming filesystem KV-cache stores with %d GiB available.",
++                available // 1024**3,
++            )
++        return self._space_available
++
+     @override
+     def submit_store(self, job_metadata: JobMetadata) -> None:
++        if not self._has_store_space():
++            self._rejected_store_jobs.append(job_metadata.job_id)
++            return
+         if self.events is not None:
+             self._store_job_keys[job_metadata.job_id] = list(job_metadata.keys)
+         task = functools.partial(
+@@ -235,7 +284,11 @@
+         """
+         Collect completed jobs from the finished-jobs queue.
+         """
+-        results = []
++        results = [
++            JobResult(job_id=job_id, success=False)
++            for job_id in self._rejected_store_jobs
++        ]
++        self._rejected_store_jobs.clear()
+         for job_id, success in self._pool.get_finished():
+             if self.events is not None:
+                 keys = self._store_job_keys.pop(job_id, None)
+@@ -279,3 +332,4 @@
+         """
+         self._lookup_manager.shutdown()
+         self._pool.shutdown(wait=True)
++
+

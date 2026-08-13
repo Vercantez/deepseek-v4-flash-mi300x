@@ -1,0 +1,9 @@
+[Unit]
+Description=Bound the vLLM filesystem KV cache
+ConditionDirectoryNotEmpty=/var/lib/vllm-kv
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/prune-vllm-kv-cache
+Nice=19
+IOSchedulingClass=idle
