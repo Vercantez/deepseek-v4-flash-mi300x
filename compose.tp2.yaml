@@ -54,7 +54,7 @@ services:
       - --long-prefill-token-threshold
       - ${LONG_PREFILL_TOKEN_THRESHOLD:-4096}
       - --moe-backend
-      - triton
+      - ${MOE_BACKEND:-triton}
       - --linear-backend
       - auto
       - --speculative-config.method=dspark
