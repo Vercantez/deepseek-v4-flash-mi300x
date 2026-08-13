@@ -1,8 +1,13 @@
 # Patch provenance
 
-The `*.py` files in this directory are **byte-for-byte the overlays that run in
+Most `*.py` files in this directory are **byte-for-byte the overlays that run in
 production** (see `../SHA256SUMS`). They are mounted read-only over files inside
 the pinned vLLM ROCm container image by `../compose.yaml`.
+
+`apply-deepseek-v4-reasoning-effort.py` is the exception: the entrypoint runs it
+once against two exact, version-checked source blocks. It fails closed if the
+pinned vLLM source changes, avoiding two large tokenizer overlays for a small
+compatibility backport.
 
 The `diffs/*.patch` files in this directory are informational unified diffs showing
 exactly what each overlay changes relative to an upstream base revision. They were
@@ -22,6 +27,7 @@ generated with `diff -u` on 2026-08-04 against:
 | `kv_offload_cpu_gpu_worker.load-war.py` | `vllm-project/vllm` `main` @ `cb8104839c141609d99f1254459ef3a4f1bd4263` — `vllm/v1/kv_offload/cpu/gpu_worker.py` (post-#46278 state; PR #47291 is not merged upstream) |
 | `tiering-fs-bounded-lru.py` | New companion module for the filesystem manager overlay; implements shard leases and background atomic LRU eviction without modifying upstream package initialization |
 | `tiering-fs-manager.disk-reserve.py` | `vllm-project/vllm` @ `124154a8843d1f8e4d4e2d5d466e2d3ebc3716da` — `vllm/v1/kv_offload/tiering/fs/manager.py` |
+| `apply-deepseek-v4-reasoning-effort.py` | `vllm-project/vllm` @ `124154a8843d1f8e4d4e2d5d466e2d3ebc3716da`; backports the `low`/`high`/`max` prompts published in DeepSeek V4 Flash 0731 model revision `7872f01b1d1fe23eabc4c98b48bffcef5a386062` |
 | `parser-deepseek-v32.dsml-orphan.py`, `parser-deepseek-v4.dsml-orphan.py`, `parser-engine.dsml-orphan.py`, `parser-engine-config.dsml-orphan.py`, `streaming-parser-engine.dsml-orphan.py`, `tool-parser-utils.dsml-orphan.py` | `vllm-project/vllm` @ `124154a8843d1f8e4d4e2d5d466e2d3ebc3716da`; backport of PR #49117 head `7ef0ae2480799e95fb7cb801a8105c1db2585164` |
 | `structural-tag-registry.deepseek-v4-auto.py` | `vllm-project/vllm` @ `124154a8843d1f8e4d4e2d5d466e2d3ebc3716da`; adaptation of PR #46632 commit `857187ab10a951270ce1192ead64a14afd4ce41b` |
 

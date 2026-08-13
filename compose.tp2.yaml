@@ -1,0 +1,56 @@
+# Two-MI300X production override. Start only the inference service:
+#   HF_CACHE=/home/hotaisle/.cache/huggingface \
+#     docker compose -f compose.yaml -f compose.tp2.yaml up -d inference
+services:
+  inference:
+    container_name: deepseek-v4-flash-0731-dspark-mi300x
+    network_mode: host
+    command:
+      - /root/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash-0731/snapshots/7872f01b1d1fe23eabc4c98b48bffcef5a386062
+      - --host
+      - 127.0.0.1
+      - --port
+      - "8000"
+      - --served-model-name
+      - deepseek-ai/DeepSeek-V4-Flash-0731
+      - --tensor-parallel-size
+      - "2"
+      - --trust-remote-code
+      - --tokenizer-mode
+      - deepseek_v4
+      - --generation-config
+      - vllm
+      - --reasoning-parser
+      - deepseek_v4
+      - --tool-call-parser
+      - deepseek_v4
+      - --enable-auto-tool-choice
+      - --enable-prompt-tokens-details
+      - --kv-cache-dtype
+      - fp8
+      - --block-size
+      - "256"
+      - --max-model-len
+      - "262144"
+      - --kv-cache-memory-bytes
+      - "80000000000"
+      - --kv-offloading-size
+      - "96"
+      - --kv-offloading-backend
+      - native
+      - --kv-transfer-config
+      - '{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"spec_name":"TieringOffloadingSpec","secondary_tiers":[{"type":"fs","root_dir":"/var/cache/vllm-kv","n_read_threads":16,"n_write_threads":16,"locality":"LOCAL","min_free_gb":2048,"space_check_interval_seconds":1,"eviction_trigger_free_gb":2560,"eviction_target_free_gb":3072,"shard_touch_interval_seconds":30}]}}'
+      - --max-num-seqs
+      - "128"
+      - --max-num-batched-tokens
+      - "4096"
+      - --long-prefill-token-threshold
+      - "4096"
+      - --moe-backend
+      - triton
+      - --linear-backend
+      - auto
+      - --speculative-config.method=dspark
+      - --speculative-config.num-speculative-tokens=7
+      - --speculative-config.draft-sample-method=probabilistic
+      - --speculative-config.rejection-sample-method=block

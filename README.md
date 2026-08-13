@@ -134,7 +134,7 @@ curl -sS "https://$HOST/v1/completions" \
 
 ## The patches
 
-Each `patches/*.py` file is a **full-file overlay** mounted read-only over its counterpart in the container; `compose.yaml` contains the target paths. The corresponding `diffs/*.patch` records the change from its upstream base. The base image remains digest-pinned, so upgrades require changing the image reference and revalidating the stack.
+Most `patches/*.py` files are **full-file overlays** mounted read-only over their counterparts in the container; `compose.yaml` contains the target paths. The reasoning-effort compatibility patch is a fail-closed source transformer run by the entrypoint because it changes two small pinned blocks. The corresponding `diffs/*.patch` records overlay changes from their upstream bases. The base image remains digest-pinned, so upgrades require changing the image reference and revalidating the stack.
 
 | Overlay | Mounted over | Fixes | Needed when |
 | --- | --- | --- | --- |
@@ -149,6 +149,7 @@ Each `patches/*.py` file is a **full-file overlay** mounted read-only over its c
 | `kv_offload_cpu_gpu_worker.load-war.py` | `vllm/v1/kv_offload/cpu/gpu_worker.py` | Fence CPU→GPU KV restores behind in-flight compute ([#47282](https://github.com/vllm-project/vllm/issues/47282), [PR #47291](https://github.com/vllm-project/vllm/pull/47291)) | Required only with `--kv-offloading-backend native` |
 | `offloading-scheduler.dspark-prefix.py` | `vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py` | Exclude DSpark's ephemeral draft group from reusable prefix lookup/load | Required with DSpark + native/tiered KV offload; based on [#47890](https://github.com/vllm-project/vllm/issues/47890) / [#47891](https://github.com/vllm-project/vllm/pull/47891) |
 | `tiering-fs-bounded-lru.py` + `tiering-fs-manager.disk-reserve.py` | `vllm/v1/kv_offload/tiering/fs/bounded_lru.py` + `.../fs/manager.py` | Lease shards used by requests/transfers, atomically retire only idle LRU shards in the background, and reject new stores before consuming the 2 TiB OS reserve | Required with the filesystem tier until upstream implements bounded secondary-tier eviction |
+| `apply-deepseek-v4-reasoning-effort.py` | Patches `vllm/tokenizers/deepseek_v4.py` + `deepseek_v4_encoding.py` at startup | Restore the model revision's native `low`/`high`/`max` prefixes and normalize OpenAI aliases (`minimal→low`, `medium→high`, `xhigh→max`) | Required with pinned vLLM `124154a88`; remove after upstream adopts the 0731 encoding revision |
 | `structural-tag-registry.deepseek-v4-auto.py` | `vllm/tool_parsers/structural_tag_registry.py` | Keep triggered DSML grammar enabled for `tool_choice=auto` + non-strict tools | Required for reliable OpenCode-style tool calls; based on [#40801](https://github.com/vllm-project/vllm/issues/40801) / [#46632](https://github.com/vllm-project/vllm/pull/46632) |
 | `parser-*.dsml-orphan.py` + `tool-parser-utils.dsml-orphan.py` | `vllm/parser/...` + `vllm/tool_parsers/utils.py` | Recover declared DSML invokes when the model omits the outer `tool_calls` wrapper | Required for long-context agent sessions; backported from [#49117](https://github.com/vllm-project/vllm/pull/49117) |
 
@@ -163,6 +164,19 @@ Each `patches/*.py` file is a **full-file overlay** mounted read-only over its c
 This stack uses probabilistic drafting with block rejection. The two Gumbel overlays keep draft-proposal noise independent of rejection and recovery noise.
 
 ## Performance
+
+### Two-GPU deployment
+
+`compose.tp2.yaml` preserves the validated two-MI300X settings: TP=2,
+80 GB of GPU KV cache per worker, 128 active sequences, 4,096-token prefill
+slices, and DSpark-7. It also inherits the lease-safe filesystem cache and
+reasoning-effort patch from the base Compose file. On a Hot Aisle host whose
+model cache belongs to the `hotaisle` user, start only inference with:
+
+```bash
+HF_CACHE=/home/hotaisle/.cache/huggingface \
+  docker compose -f compose.yaml -f compose.tp2.yaml up -d inference
+```
 
 Key optimizations in the production configuration:
 
