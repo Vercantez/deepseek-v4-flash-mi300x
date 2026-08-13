@@ -21,10 +21,7 @@ from triton_kernels.matmul_ogs import (  # noqa: E402
     FlexCtx,
     FnSpecs,
     FusedActivation,
-    GatherIndx,
     PrecisionConfig,
-    RoutingData,
-    ScatterIndx,
     matmul_ogs,
 )
 from triton_kernels.matmul_ogs_details.opt_flags import (  # noqa: E402
@@ -35,8 +32,9 @@ from triton_kernels.matmul_ogs_details.opt_flags import (  # noqa: E402
 from triton_kernels.numerics import InFlexData  # noqa: E402
 from triton_kernels.numerics_details.mxfp import downcast_to_mxfp  # noqa: E402
 from triton_kernels.target_info import get_cdna_version  # noqa: E402
-from triton_kernels.tensor import make_ragged_tensor_metadata  # noqa: E402
-from triton_kernels.topk import topk  # noqa: E402
+from vllm.model_executor.layers.fused_moe.experts.gpt_oss_triton_kernels_moe import (  # noqa: E402
+    make_routing_data,
+)
 
 
 @triton.jit
@@ -50,18 +48,16 @@ def silu_mul(inp):
 
 
 def make_routing(batch: int, num_experts: int, top_k: int, device: str):
-    logits = torch.randn((batch, num_experts), device=device, dtype=torch.float32)
-    result = topk(logits, top_k, apply_softmax=True)
-    dispatch = result.mask_metadata.row_sorted_indx
-    combine = result.mask_metadata.col_sorted_indx
-    metadata = make_ragged_tensor_metadata(
-        result.mask_metadata.col_sum, dispatch.shape[0]
+    rows = torch.arange(batch, device=device, dtype=torch.int64)[:, None]
+    slots = torch.arange(top_k, device=device, dtype=torch.int64)[None, :]
+    topk_ids = ((rows * top_k + slots) % num_experts).to(torch.int32)
+    topk_weights = torch.full(
+        (batch, top_k),
+        1.0 / top_k,
+        device=device,
+        dtype=torch.float32,
     )
-    gates = result.vals.flatten()[combine]
-    routing = RoutingData(
-        gates, metadata.slice_sizes, num_experts, top_k, metadata
-    )
-    return routing, GatherIndx(combine, dispatch), ScatterIndx(dispatch, combine)
+    return make_routing_data(topk_ids, topk_weights, num_experts)
 
 
 def quantize_mxfp4(weight: torch.Tensor):
