@@ -173,9 +173,7 @@ def make_default_opt_flags_amd(
     ):
         if m <= 1536:
             ret.block_m = 16
-            # BN=64 cuts the W2 latency materially at DSpark's M=8 shape
-            # without changing numerics; BN=32 remains slower on gfx942.
-            ret.block_n = 64 if m <= 12 else 128
+            ret.block_n = 32 if m <= 12 else 128
             ret.block_k = 256
             if m <= 6:
                 ret.num_warps = 2
