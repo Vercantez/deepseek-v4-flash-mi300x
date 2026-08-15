@@ -502,13 +502,17 @@ class OffloadingConnectorScheduler:
             timeout_threshold=int(
                 extra_config.get("lookup_timeout_threshold", 3)
             ),
+            max_concurrent_lookups=int(
+                extra_config.get("max_concurrent_lookups", 1)
+            ),
         )
         logger.info(
             "External KV lookup fail-open enabled: %.3fs deadline, %d timeouts, "
-            "%.1fs circuit breaker",
+            "%.1fs circuit breaker, %d concurrent probes",
             self._lookup_fail_open.timeout_seconds,
             self._lookup_fail_open.timeout_threshold,
             self._lookup_fail_open.circuit_breaker_seconds,
+            self._lookup_fail_open.max_concurrent_lookups,
         )
         self._stores_enabled = bool(extra_config.get("stores_enabled", True))
         if not self._stores_enabled:

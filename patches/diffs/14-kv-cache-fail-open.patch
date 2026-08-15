@@ -284,10 +284,10 @@ index 0000000..f329bc7
 +                self._pending_results.put(results)
 diff --git a/patches/kv_lookup_fail_open.py b/patches/kv_lookup_fail_open.py
 new file mode 100644
-index 0000000..a371d7b
+index 0000000..72aaa4d
 --- /dev/null
 +++ b/patches/kv_lookup_fail_open.py
-@@ -0,0 +1,103 @@
+@@ -0,0 +1,110 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""Bounded, fail-open policy for optional external KV-cache lookups.
 +
@@ -318,6 +318,7 @@ index 0000000..a371d7b
 +        timeout_seconds: float = 0.1,
 +        circuit_breaker_seconds: float = 30.0,
 +        timeout_threshold: int = 3,
++        max_concurrent_lookups: int = 1,
 +    ) -> None:
 +        if timeout_seconds <= 0:
 +            raise ValueError("timeout_seconds must be positive")
@@ -325,9 +326,12 @@ index 0000000..a371d7b
 +            raise ValueError("circuit_breaker_seconds must be positive")
 +        if timeout_threshold <= 0:
 +            raise ValueError("timeout_threshold must be positive")
++        if max_concurrent_lookups <= 0:
++            raise ValueError("max_concurrent_lookups must be positive")
 +        self.timeout_seconds = timeout_seconds
 +        self.circuit_breaker_seconds = circuit_breaker_seconds
 +        self.timeout_threshold = timeout_threshold
++        self.max_concurrent_lookups = max_concurrent_lookups
 +        self._deferred: dict[str, float] = {}
 +        self._consecutive_timeouts = 0
 +        self._circuit_open_until = 0.0
@@ -355,11 +359,14 @@ index 0000000..a371d7b
 +            self._deferred.pop(request_id, None)
 +            self._circuit_bypass_delta += 1
 +            return "circuit_open"
-+        # A single metadata request can contain thousands of block paths. Let
-+        # one request probe the filesystem while concurrent requests compute
-+        # locally; otherwise a post-restart burst can park the entire engine
-+        # before the first probe has a chance to trip the circuit breaker.
-+        if self._deferred and request_id not in self._deferred:
++        # A single metadata request can contain thousands of block paths. Keep
++        # concurrent filesystem probes bounded so several batch members can
++        # reuse disk KV without allowing a post-restart burst to park the
++        # entire engine before the circuit breaker can trip.
++        if (
++            request_id not in self._deferred
++            and len(self._deferred) >= self.max_concurrent_lookups
++        ):
 +            self._circuit_bypass_delta += 1
 +            return "lookup_in_flight"
 +        return None
@@ -392,7 +399,7 @@ index 0000000..a371d7b
 +            self._circuit_bypass_delta = 0
 +        return snapshot
 diff --git a/patches/offloading-scheduler.dspark-prefix.py b/patches/offloading-scheduler.dspark-prefix.py
-index 0eebb5f..998beef 100644
+index 0eebb5f..49c6bad 100644
 --- a/patches/offloading-scheduler.dspark-prefix.py
 +++ b/patches/offloading-scheduler.dspark-prefix.py
 @@ -26,6 +26,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
@@ -423,7 +430,7 @@ index 0eebb5f..998beef 100644
      # True once on_request_finished has been signaled to the manager.
      finished_signaled: bool = False
      # DSpark draft groups excluded by the latest successful external lookup.
-@@ -481,6 +488,34 @@ class OffloadingConnectorScheduler:
+@@ -481,6 +488,38 @@ class OffloadingConnectorScheduler:
          )
          self.manager: OffloadingManager = spec.get_manager()
          self._connector_stats = OffloadingConnectorStats()
@@ -441,13 +448,17 @@ index 0eebb5f..998beef 100644
 +            timeout_threshold=int(
 +                extra_config.get("lookup_timeout_threshold", 3)
 +            ),
++            max_concurrent_lookups=int(
++                extra_config.get("max_concurrent_lookups", 1)
++            ),
 +        )
 +        logger.info(
 +            "External KV lookup fail-open enabled: %.3fs deadline, %d timeouts, "
-+            "%.1fs circuit breaker",
++            "%.1fs circuit breaker, %d concurrent probes",
 +            self._lookup_fail_open.timeout_seconds,
 +            self._lookup_fail_open.timeout_threshold,
 +            self._lookup_fail_open.circuit_breaker_seconds,
++            self._lookup_fail_open.max_concurrent_lookups,
 +        )
 +        self._stores_enabled = bool(extra_config.get("stores_enabled", True))
 +        if not self._stores_enabled:
@@ -458,7 +469,7 @@ index 0eebb5f..998beef 100644
  
          full_attention_groups: list[int] = []
          sliding_window_groups: list[int] = []
-@@ -905,8 +940,29 @@ class OffloadingConnectorScheduler:
+@@ -905,8 +944,29 @@ class OffloadingConnectorScheduler:
          req_status.num_locally_computed_tokens = num_computed_tokens
  
          num_hit_tokens: int | None
@@ -489,7 +500,7 @@ index 0eebb5f..998beef 100644
          else:
              lookup_start = time.monotonic()
              num_hit_tokens = self._lookup(req_status)
-@@ -917,7 +973,29 @@ class OffloadingConnectorScheduler:
+@@ -917,7 +977,29 @@ class OffloadingConnectorScheduler:
              if num_hit_tokens is None:
                  if req_status.deferred_lookup_start_time is None:
                      req_status.deferred_lookup_start_time = lookup_start
@@ -519,7 +530,7 @@ index 0eebb5f..998beef 100644
                  self._maybe_observe_lookup_async_delay(req_status)
          req_status.update_num_hit_chunks(num_computed_tokens + (num_hit_tokens or 0))
  
-@@ -1084,6 +1162,12 @@ class OffloadingConnectorScheduler:
+@@ -1084,6 +1166,12 @@ class OffloadingConnectorScheduler:
          self,
          scheduler_output: SchedulerOutput,
      ) -> dict[int, TransferJob]:
@@ -532,7 +543,7 @@ index 0eebb5f..998beef 100644
          blocks_per_chunk = self.config.blocks_per_chunk
          store_jobs: dict[int, TransferJob] = {}
          for req_id in chain(
-@@ -1420,6 +1504,30 @@ class OffloadingConnectorScheduler:
+@@ -1420,6 +1508,30 @@ class OffloadingConnectorScheduler:
                  del self._req_status[job_status.req_id]
  
      def get_stats(self) -> OffloadingConnectorStats | None:
@@ -563,7 +574,7 @@ index 0eebb5f..998beef 100644
          stats: OffloadingConnectorStats | None = None
          if not self._connector_stats.is_empty():
              stats = self._connector_stats
-@@ -1449,6 +1557,7 @@ class OffloadingConnectorScheduler:
+@@ -1449,6 +1561,7 @@ class OffloadingConnectorScheduler:
              returned by the engine.
          """
          req_status = self._req_status.get(request.request_id)

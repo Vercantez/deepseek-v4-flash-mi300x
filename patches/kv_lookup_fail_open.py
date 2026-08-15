@@ -28,6 +28,7 @@ class LookupFailOpenPolicy:
         timeout_seconds: float = 0.1,
         circuit_breaker_seconds: float = 30.0,
         timeout_threshold: int = 3,
+        max_concurrent_lookups: int = 1,
     ) -> None:
         if timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
@@ -35,9 +36,12 @@ class LookupFailOpenPolicy:
             raise ValueError("circuit_breaker_seconds must be positive")
         if timeout_threshold <= 0:
             raise ValueError("timeout_threshold must be positive")
+        if max_concurrent_lookups <= 0:
+            raise ValueError("max_concurrent_lookups must be positive")
         self.timeout_seconds = timeout_seconds
         self.circuit_breaker_seconds = circuit_breaker_seconds
         self.timeout_threshold = timeout_threshold
+        self.max_concurrent_lookups = max_concurrent_lookups
         self._deferred: dict[str, float] = {}
         self._consecutive_timeouts = 0
         self._circuit_open_until = 0.0
@@ -65,11 +69,14 @@ class LookupFailOpenPolicy:
             self._deferred.pop(request_id, None)
             self._circuit_bypass_delta += 1
             return "circuit_open"
-        # A single metadata request can contain thousands of block paths. Let
-        # one request probe the filesystem while concurrent requests compute
-        # locally; otherwise a post-restart burst can park the entire engine
-        # before the first probe has a chance to trip the circuit breaker.
-        if self._deferred and request_id not in self._deferred:
+        # A single metadata request can contain thousands of block paths. Keep
+        # concurrent filesystem probes bounded so several batch members can
+        # reuse disk KV without allowing a post-restart burst to park the
+        # entire engine before the circuit breaker can trip.
+        if (
+            request_id not in self._deferred
+            and len(self._deferred) >= self.max_concurrent_lookups
+        ):
             self._circuit_bypass_delta += 1
             return "lookup_in_flight"
         return None

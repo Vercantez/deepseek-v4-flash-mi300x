@@ -82,6 +82,11 @@ a read-only host page. Read-only cache mode removes that engine-killing DMA
 direction while preserving filesystem cache fulfills. The single-GPU override
 continues normal cache reads and writes.
 
+Filesystem metadata lookup admits up to four concurrent requests into its
+asynchronous probe path. The 100 ms deadline, eight-batch queue, and circuit
+breaker remain fail-open, so multiple sequences in a scheduler batch can reuse
+disk KV without letting storage latency block inference.
+
 ### 2. Pull the pinned runtime and model
 
 ```bash
