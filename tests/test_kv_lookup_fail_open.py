@@ -42,6 +42,19 @@ class LookupFailOpenPolicyTests(unittest.TestCase):
         policy.resolve("probe")
         self.assertFalse(policy.snapshot(32.1).circuit_open)
 
+    def test_deadline_check_can_be_deferred_until_after_result_drain(self) -> None:
+        policy = module.LookupFailOpenPolicy(timeout_seconds=0.1)
+        policy.defer("ready", 10.0)
+
+        # The scheduler may return well after 100 ms. A caller can check only
+        # the circuit before draining a completed result, then resolve it
+        # without incorrectly counting a timeout.
+        self.assertIsNone(policy.circuit_bypass_reason("ready", 12.0))
+        policy.resolve("ready")
+        snapshot = policy.snapshot(12.0)
+        self.assertEqual(snapshot.timeout_total, 0)
+        self.assertEqual(snapshot.deferred_requests, 0)
+
     def test_finish_cancels_deadline_and_counters_are_delta_based(self) -> None:
         policy = module.LookupFailOpenPolicy(timeout_seconds=0.1)
         policy.defer("finished", 1.0)

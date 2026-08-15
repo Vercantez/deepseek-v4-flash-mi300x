@@ -46,10 +46,9 @@ class LookupFailOpenPolicy:
 
     def bypass_reason(self, request_id: str, now: float) -> str | None:
         """Return why this request should bypass external cache, if at all."""
-        if now < self._circuit_open_until:
-            self._deferred.pop(request_id, None)
-            self._circuit_bypass_delta += 1
-            return "circuit_open"
+        circuit_reason = self.circuit_bypass_reason(request_id, now)
+        if circuit_reason is not None:
+            return circuit_reason
         started_at = self._deferred.get(request_id)
         if started_at is None or now < started_at + self.timeout_seconds:
             return None
@@ -59,6 +58,14 @@ class LookupFailOpenPolicy:
         if self._consecutive_timeouts >= self.timeout_threshold:
             self._circuit_open_until = now + self.circuit_breaker_seconds
         return "deadline"
+
+    def circuit_bypass_reason(self, request_id: str, now: float) -> str | None:
+        """Bypass new work while the circuit is open without testing a deadline."""
+        if now >= self._circuit_open_until:
+            return None
+        self._deferred.pop(request_id, None)
+        self._circuit_bypass_delta += 1
+        return "circuit_open"
 
     def defer(self, request_id: str, started_at: float) -> None:
         """Start a request deadline without moving it on later scheduler ticks."""

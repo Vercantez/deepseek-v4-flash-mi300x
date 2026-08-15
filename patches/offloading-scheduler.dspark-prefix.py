@@ -940,7 +940,11 @@ class OffloadingConnectorScheduler:
             not request.skip_reading_prefix_cache
             and not req_status.external_lookup_bypassed
         ):
-            bypass_reason = self._lookup_fail_open.bypass_reason(
+            # A scheduler step can take longer than the nominal lookup
+            # deadline. Only bypass up front for an open circuit; otherwise
+            # drain the non-blocking lookup result first so metadata that
+            # completed during model execution is not discarded as stale.
+            bypass_reason = self._lookup_fail_open.circuit_bypass_reason(
                 request_id, time.monotonic()
             )
         if request.skip_reading_prefix_cache or req_status.external_lookup_bypassed:
@@ -966,6 +970,9 @@ class OffloadingConnectorScheduler:
                 self._lookup_fail_open.defer(
                     request_id, req_status.deferred_lookup_start_time
                 )
+                # The result was still unresolved after draining this
+                # scheduler opportunity. It may now fail open if its minimum
+                # availability budget elapsed.
                 bypass_reason = self._lookup_fail_open.bypass_reason(
                     request_id, time.monotonic()
                 )
