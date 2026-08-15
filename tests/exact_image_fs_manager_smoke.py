@@ -91,6 +91,24 @@ def main() -> None:
         )
         wait_for_jobs(tier)
         np.testing.assert_array_equal(backing[1], expected)
+
+        # A corrupt secondary block must become a miss after one failed load,
+        # not a cached HIT that is promoted forever on every scheduler step.
+        with open(mapper.get_file_name(key), "wb") as output:
+            output.write(b"corrupt")
+        tier.submit_load(
+            JobMetadata(
+                job_id=3,
+                keys=[key],
+                block_ids=np.array([2], dtype=np.int64),
+                is_promotion=True,
+                req_context=ctx,
+            )
+        )
+        tier.drain_jobs()
+        failed = list(tier.get_finished_jobs())
+        assert len(failed) == 1 and not failed[0].success, failed
+        assert tier.lookup(key, ctx) is LookupResult.MISS
         tier.on_request_finished(ctx)
         tier.shutdown()
 

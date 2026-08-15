@@ -27,6 +27,8 @@ generated with `diff -u` on 2026-08-04 against:
 | `kv_offload_cpu_gpu_worker.load-war.py` | `vllm-project/vllm` `main` @ `cb8104839c141609d99f1254459ef3a4f1bd4263` — `vllm/v1/kv_offload/cpu/gpu_worker.py` (post-#46278 state; PR #47291 is not merged upstream) |
 | `tiering-fs-bounded-lru.py` | New companion module for the filesystem manager overlay; implements shard leases and background atomic LRU eviction without modifying upstream package initialization |
 | `tiering-fs-manager.disk-reserve.py` | `vllm-project/vllm` @ `124154a8843d1f8e4d4e2d5d466e2d3ebc3716da` — `vllm/v1/kv_offload/tiering/fs/manager.py` |
+| `async_lookup.bounded.py` | `vllm-project/vllm` @ `124154a8843d1f8e4d4e2d5d466e2d3ebc3716da` — `vllm/v1/kv_offload/tiering/async_lookup.py`; makes overload a cache miss instead of an unbounded queue |
+| `kv_lookup_fail_open.py` | New dependency-free scheduler policy; enforces the external-cache deadline and circuit breaker and is fault-tested without a GPU |
 | `apply-deepseek-v4-reasoning-effort.py` | `vllm-project/vllm` @ `124154a8843d1f8e4d4e2d5d466e2d3ebc3716da`; backports the `low`/`high`/`max` prompts published in DeepSeek V4 Flash 0731 model revision `7872f01b1d1fe23eabc4c98b48bffcef5a386062` |
 | `parser-deepseek-v32.dsml-orphan.py`, `parser-deepseek-v4.dsml-orphan.py`, `parser-engine.dsml-orphan.py`, `parser-engine-config.dsml-orphan.py`, `streaming-parser-engine.dsml-orphan.py`, `tool-parser-utils.dsml-orphan.py` | `vllm-project/vllm` @ `124154a8843d1f8e4d4e2d5d466e2d3ebc3716da`; backport of PR #49117 head `7ef0ae2480799e95fb7cb801a8105c1db2585164` |
 | `structural-tag-registry.deepseek-v4-auto.py` | `vllm-project/vllm` @ `124154a8843d1f8e4d4e2d5d466e2d3ebc3716da`; adaptation of PR #46632 commit `857187ab10a951270ce1192ead64a14afd4ce41b` |
@@ -43,6 +45,11 @@ diff -u --label "a/<upstream path>" --label "b/<overlay>" base.py <overlay>.py
 > image that ran in production is a vLLM ROCm nightly
 > (`0.26.1rc1.dev229+g124154a88.rocm723`), which may differ slightly from any
 > single upstream revision.
+
+`diffs/14-kv-cache-fail-open.patch` is intentionally incremental against the
+previous production overlays rather than a pristine upstream file. It groups
+the scheduler deadline, bounded async lookup, failed-load invalidation, and
+filesystem-cache metrics as one availability fix.
 
 ## Licensing
 

@@ -1,0 +1,798 @@
+# Incremental production diff: fail-open filesystem KV cache
+# Base: repository main before this availability hardening change.
+
+diff --git a/patches/offloading-scheduler.dspark-prefix.py b/patches/offloading-scheduler.dspark-prefix.py
+index 0eebb5f..e3085a8 100644
+--- a/patches/offloading-scheduler.dspark-prefix.py
++++ b/patches/offloading-scheduler.dspark-prefix.py
+@@ -26,6 +26,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
+     _ConnectorMetricName,
+     _TransferMetricName,
+ )
++from vllm.distributed.kv_transfer.kv_connector.v1.offloading.kv_lookup_fail_open import (
++    LookupFailOpenPolicy,
++)
+ from vllm.logger import init_logger
+ from vllm.utils.math_utils import cdiv, round_down
+ from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+@@ -55,6 +58,7 @@ from vllm.v1.kv_offload.base import (
+ )
+ from vllm.v1.outputs import KVConnectorOutput
+ from vllm.v1.request import Request, RequestStatus
++from vllm.v1.kv_offload.tiering.fs.manager import FileSystemTierMetrics
+ 
+ logger = init_logger(__name__)
+ 
+@@ -307,6 +311,9 @@ class RequestOffloadState:
+     # time.monotonic() of this request's first deferred offload lookup;
+     # None once consumed (observed) or while no lookup is pending.
+     deferred_lookup_start_time: float | None = None
++    # Once a secondary lookup exceeds its availability budget, this request
++    # computes its missing prefix locally. GPU prefix hits remain intact.
++    external_lookup_bypassed: bool = False
+     # True once on_request_finished has been signaled to the manager.
+     finished_signaled: bool = False
+     # DSpark draft groups excluded by the latest successful external lookup.
+@@ -481,6 +488,28 @@ class OffloadingConnectorScheduler:
+         )
+         self.manager: OffloadingManager = spec.get_manager()
+         self._connector_stats = OffloadingConnectorStats()
++        transfer_config = vllm_config.kv_transfer_config
++        extra_config = (
++            transfer_config.kv_connector_extra_config
++            if transfer_config is not None
++            else {}
++        )
++        self._lookup_fail_open = LookupFailOpenPolicy(
++            timeout_seconds=float(extra_config.get("lookup_timeout_seconds", 0.1)),
++            circuit_breaker_seconds=float(
++                extra_config.get("lookup_circuit_breaker_seconds", 30)
++            ),
++            timeout_threshold=int(
++                extra_config.get("lookup_timeout_threshold", 3)
++            ),
++        )
++        logger.info(
++            "External KV lookup fail-open enabled: %.3fs deadline, %d timeouts, "
++            "%.1fs circuit breaker",
++            self._lookup_fail_open.timeout_seconds,
++            self._lookup_fail_open.timeout_threshold,
++            self._lookup_fail_open.circuit_breaker_seconds,
++        )
+ 
+         full_attention_groups: list[int] = []
+         sliding_window_groups: list[int] = []
+@@ -905,8 +934,25 @@ class OffloadingConnectorScheduler:
+         req_status.num_locally_computed_tokens = num_computed_tokens
+ 
+         num_hit_tokens: int | None
+-        if request.skip_reading_prefix_cache:
++        request_id = request.request_id
++        bypass_reason = None
++        if (
++            not request.skip_reading_prefix_cache
++            and not req_status.external_lookup_bypassed
++        ):
++            bypass_reason = self._lookup_fail_open.bypass_reason(
++                request_id, time.monotonic()
++            )
++        if request.skip_reading_prefix_cache or req_status.external_lookup_bypassed:
+             num_hit_tokens = 0
++        elif bypass_reason is not None:
++            req_status.external_lookup_bypassed = True
++            num_hit_tokens = 0
++            logger.warning(
++                "Failing open external KV lookup for request %s (%s)",
++                request_id,
++                bypass_reason,
++            )
+         else:
+             lookup_start = time.monotonic()
+             num_hit_tokens = self._lookup(req_status)
+@@ -917,7 +963,26 @@ class OffloadingConnectorScheduler:
+             if num_hit_tokens is None:
+                 if req_status.deferred_lookup_start_time is None:
+                     req_status.deferred_lookup_start_time = lookup_start
++                self._lookup_fail_open.defer(
++                    request_id, req_status.deferred_lookup_start_time
++                )
++                bypass_reason = self._lookup_fail_open.bypass_reason(
++                    request_id, time.monotonic()
++                )
++                if bypass_reason is not None:
++                    waited = time.monotonic() - req_status.deferred_lookup_start_time
++                    req_status.external_lookup_bypassed = True
++                    num_hit_tokens = 0
++                    self._maybe_observe_lookup_async_delay(req_status)
++                    logger.warning(
++                        "External KV lookup for request %s exceeded its %.3fs "
++                        "availability budget after %.3fs; computing locally",
++                        request_id,
++                        self._lookup_fail_open.timeout_seconds,
++                        waited,
++                    )
+             else:
++                self._lookup_fail_open.resolve(request_id)
+                 self._maybe_observe_lookup_async_delay(req_status)
+         req_status.update_num_hit_chunks(num_computed_tokens + (num_hit_tokens or 0))
+ 
+@@ -1420,6 +1485,30 @@ class OffloadingConnectorScheduler:
+                 del self._req_status[job_status.req_id]
+ 
+     def get_stats(self) -> OffloadingConnectorStats | None:
++        fail_open = self._lookup_fail_open.snapshot(
++            time.monotonic(), reset_counters=True
++        )
++        if fail_open.timeout_total:
++            self._connector_stats.increase_counter(
++                FileSystemTierMetrics.REQUEST_TIMEOUT, fail_open.timeout_total
++            )
++        if fail_open.circuit_bypass_total:
++            self._connector_stats.increase_counter(
++                FileSystemTierMetrics.CIRCUIT_BYPASS,
++                fail_open.circuit_bypass_total,
++            )
++        self._connector_stats.set_gauge(
++            FileSystemTierMetrics.DEFERRED_REQUESTS,
++            fail_open.deferred_requests,
++        )
++        self._connector_stats.set_gauge(
++            FileSystemTierMetrics.OLDEST_DEFERRED,
++            fail_open.oldest_deferred_seconds,
++        )
++        self._connector_stats.set_gauge(
++            FileSystemTierMetrics.CIRCUIT_OPEN,
++            int(fail_open.circuit_open),
++        )
+         stats: OffloadingConnectorStats | None = None
+         if not self._connector_stats.is_empty():
+             stats = self._connector_stats
+@@ -1449,6 +1538,7 @@ class OffloadingConnectorScheduler:
+             returned by the engine.
+         """
+         req_status = self._req_status.get(request.request_id)
++        self._lookup_fail_open.finish(request.request_id)
+ 
+         if req_status is None:
+             # Untracked request (offloading never started): no in-flight jobs,
+diff --git a/patches/tiering-fs-manager.disk-reserve.py b/patches/tiering-fs-manager.disk-reserve.py
+index 94c4663..d5b5982 100644
+--- a/patches/tiering-fs-manager.disk-reserve.py
++++ b/patches/tiering-fs-manager.disk-reserve.py
+@@ -33,11 +33,17 @@ except ImportError:
+ from typing_extensions import override
+ 
+ from vllm.logger import init_logger
++from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
++    OffloadingConnectorStats,
++)
+ from vllm.v1.kv_offload.base import (
+     Locality,
+     LookupResult,
+     Medium,
++    OffloadingCounterMetadata,
+     OffloadingEvent,
++    OffloadingGaugeMetadata,
++    OffloadingMetricMetadata,
+     OffloadKey,
+     ReqContext,
+ )
+@@ -68,6 +74,23 @@ if TYPE_CHECKING:
+ logger = init_logger(__name__)
+ 
+ 
++class FileSystemTierMetrics:
++    """Prometheus names for fail-open filesystem-cache health."""
++
++    REQUEST_TIMEOUT = "vllm:kv_offload_fs_request_timeouts"
++    CIRCUIT_BYPASS = "vllm:kv_offload_fs_circuit_bypasses"
++    QUEUE_DROPPED_KEYS = "vllm:kv_offload_fs_lookup_dropped_keys"
++    LOAD_FAILURE = "vllm:kv_offload_fs_load_failures"
++    DEFERRED_REQUESTS = "vllm:kv_offload_fs_deferred_requests"
++    OLDEST_DEFERRED = "vllm:kv_offload_fs_oldest_deferred_seconds"
++    CIRCUIT_OPEN = "vllm:kv_offload_fs_circuit_open"
++    PENDING_BATCHES = "vllm:kv_offload_fs_lookup_pending_batches"
++    PENDING_KEYS = "vllm:kv_offload_fs_lookup_pending_keys"
++    EVICTION_ACTIVE = "vllm:kv_offload_fs_eviction_active"
++    EVICTIONS_IN_FLIGHT = "vllm:kv_offload_fs_evictions_in_flight"
++    FREE_BYTES = "vllm:kv_offload_fs_free_bytes"
++
++
+ class FsAsyncLookupManager(AsyncLookupManager):
+     """Async lookup manager for FileSystemTierManager."""
+ 
+@@ -75,8 +98,14 @@ class FsAsyncLookupManager(AsyncLookupManager):
+         self,
+         tier: "FileSystemTierManager",
+         tier_type: str,
++        max_pending_batches: int,
++        max_keys_per_step: int,
+     ) -> None:
+-        super().__init__(tier_type=tier_type)
++        super().__init__(
++            tier_type=tier_type,
++            max_pending_batches=max_pending_batches,
++            max_keys_per_step=max_keys_per_step,
++        )
+         self._tier = tier
+ 
+     def batch_lookup(
+@@ -120,6 +149,59 @@ class FileSystemTierManager(SecondaryTierManager):
+ 
+     medium: ClassVar[Medium] = Medium.STORAGE
+ 
++    @classmethod
++    def build_metric_definitions(
++        cls, extra_config: dict[str, object]
++    ) -> dict[str, OffloadingMetricMetadata]:
++        counter_docs = {
++            FileSystemTierMetrics.REQUEST_TIMEOUT: (
++                "Requests that treated external KV as a miss after its deadline."
++            ),
++            FileSystemTierMetrics.CIRCUIT_BYPASS: (
++                "Requests that bypassed external KV while its circuit was open."
++            ),
++            FileSystemTierMetrics.QUEUE_DROPPED_KEYS: (
++                "Filesystem lookup keys dropped as misses to keep queues bounded."
++            ),
++            FileSystemTierMetrics.LOAD_FAILURE: (
++                "Filesystem KV load jobs that failed and invalidated cached hits."
++            ),
++        }
++        gauge_docs = {
++            FileSystemTierMetrics.DEFERRED_REQUESTS: "Requests awaiting external KV.",
++            FileSystemTierMetrics.OLDEST_DEFERRED: (
++                "Age in seconds of the oldest external KV lookup wait."
++            ),
++            FileSystemTierMetrics.CIRCUIT_OPEN: (
++                "Whether external KV reads are temporarily bypassed."
++            ),
++            FileSystemTierMetrics.PENDING_BATCHES: (
++                "Filesystem metadata batches queued to the lookup worker."
++            ),
++            FileSystemTierMetrics.PENDING_KEYS: (
++                "Filesystem metadata keys accumulated for the current step."
++            ),
++            FileSystemTierMetrics.EVICTION_ACTIVE: (
++                "Whether filesystem KV eviction is restoring its disk reserve."
++            ),
++            FileSystemTierMetrics.EVICTIONS_IN_FLIGHT: (
++                "Filesystem KV shards currently being retired."
++            ),
++            FileSystemTierMetrics.FREE_BYTES: (
++                "Available bytes on the filesystem KV cache volume."
++            ),
++        }
++        return {
++            **{
++                name: OffloadingCounterMetadata(documentation=documentation)
++                for name, documentation in counter_docs.items()
++            },
++            **{
++                name: OffloadingGaugeMetadata(documentation=documentation)
++                for name, documentation in gauge_docs.items()
++            },
++        }
++
+     def __init__(
+         self,
+         offloading_spec: "OffloadingSpec",
+@@ -135,6 +217,8 @@ class FileSystemTierManager(SecondaryTierManager):
+         eviction_trigger_free_gb: float = 0,
+         eviction_target_free_gb: float = 0,
+         shard_touch_interval_seconds: float = 30,
++        max_pending_lookup_batches: int = 8,
++        max_lookup_keys_per_step: int = 16_384,
+     ):
+         """
+         Args:
+@@ -162,6 +246,10 @@ class FileSystemTierManager(SecondaryTierManager):
+                 space is restored. Must be at least the trigger.
+             shard_touch_interval_seconds: Minimum interval between persisting
+                 a shard's LRU timestamp to its directory mtime.
++            max_pending_lookup_batches: Maximum scheduler-step metadata batches
++                waiting for the filesystem lookup thread. Saturation is a miss.
++            max_lookup_keys_per_step: Maximum new metadata keys admitted in one
++                scheduler step. Excess keys are treated as misses.
+         """
+         super().__init__(offloading_spec, primary_kv_view, tier_type)
+         if min_free_gb < 0:
+@@ -182,6 +270,8 @@ class FileSystemTierManager(SecondaryTierManager):
+             )
+         if shard_touch_interval_seconds < 0:
+             raise ValueError("shard_touch_interval_seconds must be non-negative")
++        if max_pending_lookup_batches <= 0 or max_lookup_keys_per_step <= 0:
++            raise ValueError("filesystem lookup queue limits must be positive")
+         self._root_dir = root_dir
+         self._min_free_bytes = int(min_free_gb * 1024**3)
+         self._eviction_trigger_bytes = int(eviction_trigger_free_gb * 1024**3)
+@@ -196,6 +286,8 @@ class FileSystemTierManager(SecondaryTierManager):
+         self._store_job_reserved_bytes: dict[JobId, int] = {}
+         self._eviction_active = False
+         self._last_no_evictable_log = 0.0
++        self._load_failure_delta = 0
++        self._stats = OffloadingConnectorStats()
+         self.locality = Locality(locality) if locality is not None else None
+ 
+         self.events: list[OffloadingEvent] | None = None
+@@ -253,6 +345,7 @@ class FileSystemTierManager(SecondaryTierManager):
+                         self._eviction_worker.submit(entry.path)
+         self._store_job_paths: dict[JobId, list[str]] = {}
+         self._load_job_paths: dict[JobId, list[str]] = {}
++        self._load_job_keys: dict[JobId, list[OffloadKey]] = {}
+ 
+         # Prefer O_DIRECT to bypass the page cache, but fall back to buffered
+         # I/O on filesystems that reject it (e.g. overlayfs, some NFS mounts)
+@@ -272,7 +365,12 @@ class FileSystemTierManager(SecondaryTierManager):
+             thread_name_prefix="vllm_kv_py_fs",
+         )
+ 
+-        self._lookup_manager = FsAsyncLookupManager(tier=self, tier_type=self.tier_type)
++        self._lookup_manager = FsAsyncLookupManager(
++            tier=self,
++            tier_type=self.tier_type,
++            max_pending_batches=max_pending_lookup_batches,
++            max_keys_per_step=max_lookup_keys_per_step,
++        )
+ 
+     @override
+     def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
+@@ -424,9 +522,12 @@ class FileSystemTierManager(SecondaryTierManager):
+     def submit_load(self, job_metadata: JobMetadata) -> None:
+         paths = [self.file_mapper.get_file_name(key) for key in job_metadata.keys]
+         if not self._leases.pin_job(job_metadata.job_id, paths):
++            self._lookup_manager.invalidate(job_metadata.keys)
++            self._load_failure_delta += 1
+             self._failed_jobs.append(job_metadata.job_id)
+             return
+         self._load_job_paths[job_metadata.job_id] = paths
++        self._load_job_keys[job_metadata.job_id] = list(job_metadata.keys)
+         task = functools.partial(
+             batch_load_block,
+             paths,
+@@ -440,6 +541,7 @@ class FileSystemTierManager(SecondaryTierManager):
+             self._pool.enqueue_load(job_metadata.job_id, 1, [task])
+         except Exception:
+             self._load_job_paths.pop(job_metadata.job_id, None)
++            self._load_job_keys.pop(job_metadata.job_id, None)
+             self._leases.release_job(job_metadata.job_id)
+             raise
+ 
+@@ -457,6 +559,7 @@ class FileSystemTierManager(SecondaryTierManager):
+         for job_id, success in self._pool.get_finished():
+             store_paths = self._store_job_paths.pop(job_id, None)
+             load_paths = self._load_job_paths.pop(job_id, None)
++            load_keys = self._load_job_keys.pop(job_id, None)
+             reserved_bytes = self._store_job_reserved_bytes.pop(job_id, 0)
+             self._reserved_store_bytes -= reserved_bytes
+             self._leases.release_job(job_id)
+@@ -464,6 +567,12 @@ class FileSystemTierManager(SecondaryTierManager):
+                 self._leases.record_store(store_paths)
+             if success and load_paths:
+                 self._leases.record_access(load_paths)
++            if not success and load_keys:
++                # A failed promotion must destroy the cached positive result.
++                # Otherwise every scheduler step can retry a file that is
++                # corrupt, missing, or already deleted by the I/O layer.
++                self._lookup_manager.invalidate(load_keys)
++                self._load_failure_delta += 1
+             if self.events is not None:
+                 keys = self._store_job_keys.pop(job_id, None)
+                 if success and keys:
+@@ -478,6 +587,40 @@ class FileSystemTierManager(SecondaryTierManager):
+             results.append(JobResult(job_id=job_id, success=success))
+         return results
+ 
++    @override
++    def get_stats(self) -> OffloadingConnectorStats | None:
++        dropped = self._lookup_manager.take_dropped_keys()
++        if dropped:
++            self._stats.increase_counter(
++                FileSystemTierMetrics.QUEUE_DROPPED_KEYS, dropped
++            )
++        if self._load_failure_delta:
++            self._stats.increase_counter(
++                FileSystemTierMetrics.LOAD_FAILURE, self._load_failure_delta
++            )
++            self._load_failure_delta = 0
++        self._stats.set_gauge(
++            FileSystemTierMetrics.PENDING_BATCHES,
++            self._lookup_manager.pending_batches,
++        )
++        self._stats.set_gauge(
++            FileSystemTierMetrics.PENDING_KEYS,
++            self._lookup_manager.pending_keys,
++        )
++        self._stats.set_gauge(
++            FileSystemTierMetrics.EVICTION_ACTIVE, int(self._eviction_active)
++        )
++        self._stats.set_gauge(
++            FileSystemTierMetrics.EVICTIONS_IN_FLIGHT,
++            self._leases.evictions_in_flight,
++        )
++        self._stats.set_gauge(
++            FileSystemTierMetrics.FREE_BYTES, self._get_available_bytes()
++        )
++        stats = self._stats
++        self._stats = OffloadingConnectorStats()
++        return stats
++
+     @override
+     def take_events(self) -> Iterable[OffloadingEvent]:
+         if self.events is not None:
+diff --git a/patches/async_lookup.bounded.py b/patches/async_lookup.bounded.py
+new file mode 100644
+index 0000000..f329bc7
+--- /dev/null
++++ b/patches/async_lookup.bounded.py
+@@ -0,0 +1,275 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""
++AsyncLookupManager: per-tier async lookup manager for secondary tier
++existence checks.
++
++Each secondary tier that wants non-blocking lookups composes its own
++AsyncLookupManager instance internally.  The manager maintains lookup
++state and uses a background thread to execute batch_lookup() calls.
++
++Locking design
++--------------
++There is no explicit lock.  Thread safety is achieved by ownership:
++
++* _lookup_state and _lookup_batch are owned exclusively by the scheduler
++  thread.  lookup(), flush(), and cleanup() read and write them directly.
++
++* _lookup_queue is written by the scheduler (flush → put_nowait, one item
++  per step) and read by the background thread (get).  queue.Queue is
++  thread-safe.
++
++* _pending_results is written by the background thread (put) and read by
++  the scheduler (get_nowait inside drain_results).  queue.SimpleQueue is
++  thread-safe by design.
++
++lookup() accumulates new keys in _lookup_batch without touching the queue.
++flush() is called once per step from the tier's on_schedule_end(), posting
++the entire batch as a single queue item so the background thread sees one
++batch per step.
++drain_results() is called before any lookup() calls in the same step, so
++lookup() is a pure OrderedDict operation.
++"""
++
++import queue
++import threading
++from abc import ABC, abstractmethod
++from collections.abc import Iterable
++from dataclasses import dataclass, field
++
++from vllm.logger import init_logger
++from vllm.v1.kv_offload.base import OffloadKey, ReqContext
++
++logger = init_logger(__name__)
++
++
++@dataclass(slots=True)
++class LookupState:
++    result: bool | None = None  # True (found), False (not found), None
++    request_ids: set[str] = field(default_factory=set)  # requests asking for the lookup
++
++
++class AsyncLookupManager(ABC):
++    """
++    Per-tier async lookup manager for secondary tier existence checks.
++
++    Each secondary tier that wants non-blocking lookups composes its own
++    AsyncLookupManager instance internally. The manager maintains lookup
++    state (cache, queue) and uses a background thread to execute the actual
++    batch_lookup() calls.
++
++    Subclasses implement only batch_lookup() — all queue management,
++    state tracking, and result delivery is provided by this base class.
++
++    The owning tier delegates its lookup(), on_schedule_end(), and
++    on_request_finished() to this manager:
++      - lookup() → drain_results() + lookup state check
++      - on_schedule_end() → flush()
++      - on_request_finished() → cleanup()
++    """
++
++    def __init__(
++        self,
++        tier_type: str,
++        max_pending_batches: int = 8,
++        max_keys_per_step: int = 16_384,
++    ) -> None:
++        if max_pending_batches <= 0:
++            raise ValueError("max_pending_batches must be positive")
++        if max_keys_per_step <= 0:
++            raise ValueError("max_keys_per_step must be positive")
++        self._tier_type = tier_type
++        self._max_keys_per_step = max_keys_per_step
++        self._dropped_keys_delta = 0
++
++        # key → LookupState; scheduler-owned, no lock needed.
++        self._lookup_state: dict[OffloadKey, LookupState] = {}
++        # req_id → keys looked up by that request (reverse index for cleanup).
++        self._req_keys: dict[str, set[OffloadKey]] = {}
++
++        # Accumulates (key, req_context) pairs during lookup() calls.
++        # Flushed as one queue item per step by flush().
++        self._lookup_batch: list[tuple[OffloadKey, ReqContext]] = []
++
++        # Scheduler → worker: one full step's batch per item.
++        # None is used as a shutdown sentinel.
++        self._lookup_queue: queue.Queue[
++            list[tuple[OffloadKey, ReqContext]] | None
++        ] = queue.Queue(maxsize=max_pending_batches)
++
++        # Worker → scheduler: completed result batches.
++        # Each item is a list of (key, found) pairs.
++        # SimpleQueue is explicitly thread-safe for one writer / one reader.
++        self._pending_results: queue.SimpleQueue[list[tuple[OffloadKey, bool]]] = (
++            queue.SimpleQueue()
++        )
++        self._need_to_drain: bool = False
++
++        self._thread = threading.Thread(
++            target=self._worker,
++            name=f"vllm_offloading_lookup_{tier_type}",
++            daemon=True,
++        )
++        self._thread.start()
++
++    @abstractmethod
++    def batch_lookup(
++        self, keys: list[OffloadKey], req_context: ReqContext
++    ) -> Iterable[bool]:
++        """
++        Check whether a batch of blocks exist in this tier.
++
++        Called from the worker thread — must be synchronous and must not
++        touch the primary tier or scheduler state.
++
++        Returns a list parallel to keys: True if present, False if not.
++        """
++        ...
++
++    # ------------------------------------------------------------------
++    # Scheduler-thread API
++    # ------------------------------------------------------------------
++
++    def lookup(self, key: OffloadKey, req_context: ReqContext) -> bool | None:
++        """
++        Non-blocking lookup called from the scheduler thread.
++
++        Returns:
++            True  — block is present in this tier.
++            False — block is not present in this tier.
++            None  — result not yet available; retry next step.
++        """
++        if self._need_to_drain:
++            self.drain_results()
++            self._need_to_drain = False
++        req_id = req_context.req_id
++        state = self._lookup_state.get(key)
++        if state is None:
++            state = LookupState()
++            self._lookup_state[key] = state
++            if len(self._lookup_batch) < self._max_keys_per_step:
++                self._lookup_batch.append((key, req_context))
++            else:
++                # The filesystem cache is optional.  A saturated metadata
++                # path is a cache miss, never scheduler backpressure.
++                state.result = False
++                self._dropped_keys_delta += 1
++        state.request_ids.add(req_id)
++        self._req_keys.setdefault(req_id, set()).add(key)
++        return state.result
++
++    def flush(self) -> None:
++        """Post this step's accumulated keys to the worker thread.
++
++        Called once per step from on_schedule_end() after all lookup() calls
++        are done. The worker receives the full batch and processes it during
++        the model-execution window, maximising time available before the next
++        step's drain_results().  Safe to call with an empty batch (no-op).
++        """
++        self._need_to_drain = True
++        if self._lookup_batch:
++            batch = self._lookup_batch
++            self._lookup_batch = []
++            try:
++                self._lookup_queue.put_nowait(batch)
++            except queue.Full:
++                for key, _ in batch:
++                    state = self._lookup_state.get(key)
++                    if state is not None:
++                        state.result = False
++                self._dropped_keys_delta += len(batch)
++
++    def drain_results(self) -> None:
++        """Apply pending worker results to _lookup_state.
++
++        Called from lookup() before checking state.
++        """
++        while True:
++            try:
++                batch = self._pending_results.get_nowait()
++            except queue.Empty:
++                break
++            for key, result in batch:
++                state = self._lookup_state.get(key)
++                if state is not None:
++                    state.result = result
++
++    def cleanup(self, req_id: str) -> None:
++        """Remove entries no longer needed by any active request.
++
++        Called from the tier's on_request_finished(). Uses the reverse
++        index to visit only keys associated with this request.
++        """
++        for key in self._req_keys.pop(req_id, ()):
++            state = self._lookup_state[key]
++            state.request_ids.discard(req_id)
++            if not state.request_ids:
++                del self._lookup_state[key]
++
++    def invalidate(self, keys: Iterable[OffloadKey]) -> None:
++        """Turn stale positive results into misses after a failed load."""
++        for key in keys:
++            state = self._lookup_state.get(key)
++            if state is not None:
++                state.result = False
++
++    def take_dropped_keys(self) -> int:
++        dropped = self._dropped_keys_delta
++        self._dropped_keys_delta = 0
++        return dropped
++
++    @property
++    def pending_batches(self) -> int:
++        return self._lookup_queue.qsize()
++
++    @property
++    def pending_keys(self) -> int:
++        return len(self._lookup_batch)
++
++    def shutdown(self) -> None:
++        """Stop the worker thread."""
++        # Shutdown is allowed to wait for bounded queued metadata work. Runtime
++        # scheduler calls never block on this queue.
++        self._lookup_queue.put(None)
++        self._thread.join()
++
++    # ------------------------------------------------------------------
++    # Internal helpers
++    # ------------------------------------------------------------------
++
++    def _worker(self) -> None:
++        while True:
++            pending = self._lookup_queue.get()
++            if pending is None:
++                break
++
++            # Group by req_id.
++            batches: dict[str, tuple[ReqContext, list[OffloadKey]]] = {}
++            for key, req_context in pending:
++                req_id = req_context.req_id
++                if req_id not in batches:
++                    batches[req_id] = (req_context, [])
++                batches[req_id][1].append(key)
++
++            if not batches:
++                continue
++
++            results: list[tuple[OffloadKey, bool]] = []
++            for req_context, keys in batches.values():
++                try:
++                    hits = self.batch_lookup(keys, req_context)
++                except Exception as exc:
++                    logger.warning(
++                        "batch_lookup failed on tier %s for %d keys: %s",
++                        self._tier_type,
++                        len(keys),
++                        exc,
++                    )
++                    hits = (False for _ in keys)
++
++                for key, hit in zip(keys, hits):
++                    results.append((key, hit))
++
++            # Post the entire batch as one item — no lock needed.
++            if results:
++                self._pending_results.put(results)
+diff --git a/patches/kv_lookup_fail_open.py b/patches/kv_lookup_fail_open.py
+new file mode 100644
+index 0000000..0b49225
+--- /dev/null
++++ b/patches/kv_lookup_fail_open.py
+@@ -0,0 +1,89 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Bounded, fail-open policy for optional external KV-cache lookups.
++
++The scheduler owns this object and calls it with monotonic timestamps.  It is
++kept free of vLLM dependencies so its timeout and circuit-breaker behavior can
++be fault-tested without a model or GPU.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++
++
++@dataclass(frozen=True, slots=True)
++class LookupFailOpenSnapshot:
++    deferred_requests: int
++    oldest_deferred_seconds: float
++    circuit_open: bool
++    timeout_total: int
++    circuit_bypass_total: int
++
++
++class LookupFailOpenPolicy:
++    """Turn an optional lookup into a miss before it can stall inference."""
++
++    def __init__(
++        self,
++        timeout_seconds: float = 0.1,
++        circuit_breaker_seconds: float = 30.0,
++        timeout_threshold: int = 3,
++    ) -> None:
++        if timeout_seconds <= 0:
++            raise ValueError("timeout_seconds must be positive")
++        if circuit_breaker_seconds <= 0:
++            raise ValueError("circuit_breaker_seconds must be positive")
++        if timeout_threshold <= 0:
++            raise ValueError("timeout_threshold must be positive")
++        self.timeout_seconds = timeout_seconds
++        self.circuit_breaker_seconds = circuit_breaker_seconds
++        self.timeout_threshold = timeout_threshold
++        self._deferred: dict[str, float] = {}
++        self._consecutive_timeouts = 0
++        self._circuit_open_until = 0.0
++        self._timeout_delta = 0
++        self._circuit_bypass_delta = 0
++
++    def bypass_reason(self, request_id: str, now: float) -> str | None:
++        """Return why this request should bypass external cache, if at all."""
++        if now < self._circuit_open_until:
++            self._deferred.pop(request_id, None)
++            self._circuit_bypass_delta += 1
++            return "circuit_open"
++        started_at = self._deferred.get(request_id)
++        if started_at is None or now < started_at + self.timeout_seconds:
++            return None
++        self._deferred.pop(request_id, None)
++        self._consecutive_timeouts += 1
++        self._timeout_delta += 1
++        if self._consecutive_timeouts >= self.timeout_threshold:
++            self._circuit_open_until = now + self.circuit_breaker_seconds
++        return "deadline"
++
++    def defer(self, request_id: str, started_at: float) -> None:
++        """Start a request deadline without moving it on later scheduler ticks."""
++        self._deferred.setdefault(request_id, started_at)
++
++    def resolve(self, request_id: str) -> None:
++        """Record a healthy lookup and close a half-open circuit."""
++        was_deferred = self._deferred.pop(request_id, None) is not None
++        if was_deferred or self._circuit_open_until:
++            self._consecutive_timeouts = 0
++            self._circuit_open_until = 0.0
++
++    def finish(self, request_id: str) -> None:
++        self._deferred.pop(request_id, None)
++
++    def snapshot(self, now: float, *, reset_counters: bool = False) -> LookupFailOpenSnapshot:
++        oldest = max((now - start for start in self._deferred.values()), default=0.0)
++        snapshot = LookupFailOpenSnapshot(
++            deferred_requests=len(self._deferred),
++            oldest_deferred_seconds=max(0.0, oldest),
++            circuit_open=now < self._circuit_open_until,
++            timeout_total=self._timeout_delta,
++            circuit_bypass_total=self._circuit_bypass_delta,
++        )
++        if reset_counters:
++            self._timeout_delta = 0
++            self._circuit_bypass_delta = 0
++        return snapshot

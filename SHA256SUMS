@@ -1,5 +1,5 @@
-dab4e5ec40ba79f42bd4be0ef617fbd7f43b8f789a4a90a3c29175d4b929c6b0  compose.yaml
-cfdb52c43abc036e7d2e2b03b5dd5bad5145e5a969329a07435c582bb3ea8bd0  compose.tp2.yaml
+439e459f65f910b6470fe74fadf43746a5a54ac62f28e74849b4416e9080e587  compose.yaml
+78222d083e1fdce730f8840674a48b11a0505ea1096acae78e336e07fa1ebe98  compose.tp2.yaml
  55e1f21cef522d3f06c088fceabe2c7472e8bdd9ee32e9b5e94681c38d5c8137  vllm-entrypoint.sh
  45bcb796dfa16541621ca689768748101def95c94210db64fd2151c1175d5afe  Caddyfile.example
  36bc2dc1d5b92baac1edf0cb9fc41ad0ffed0849e1587dbcb86500563f78f149  patches/aiter_pa_mqa_logits.i64.py
@@ -7,7 +7,7 @@ cfdb52c43abc036e7d2e2b03b5dd5bad5145e5a969329a07435c582bb3ea8bd0  compose.tp2.ya
  37aae1f2b05c734d3a87efa03133ec2e0e15e4ef88c54884675f875761595808  patches/fused_compress_quant_cache.fnuz-shuffle.py
  ed41727ed8ff7fab0aa5319ab46b630b47af4e51d82ea39fa43ee60571c69817  patches/gpt_oss_triton_kernels_moe.pack128-fused-silu-fast-routing.py
  3fa94bab26f132ed51dd8cfd8725796c3a279d60a700de7199ba15e3c71c1d4d  patches/kv_offload_cpu_gpu_worker.load-war.py
- 734fa6188828c68b9714d397630378b51530ccccb653fe6e18df573090071189  patches/offloading-scheduler.dspark-prefix.py
+ 74067fd3d15cc46c841c495ae58534a6fd718e8af9ba43f2f8c1e8fd1e7ee4d6  patches/offloading-scheduler.dspark-prefix.py
  8b1d215d9f1ad8d068d42522aefcefe968198cb4be15dd8049d95b201c8c2707  patches/parser-engine-config.dsml-orphan.py
  9381cc66a834dfd304a7bb449a6dea03c2b9fba79d44aa4662f79fc13bd6c77d  patches/parser-engine.dsml-orphan.py
  0d72534a69c8e226b126714a4682cc1ebde19c083c0fa517f92b463541661f2d  patches/parser-deepseek-v32.dsml-orphan.py
@@ -21,7 +21,9 @@ cfdb52c43abc036e7d2e2b03b5dd5bad5145e5a969329a07435c582bb3ea8bd0  compose.tp2.ya
  e025a2ca225b955f0468f1b7ab529eb238694c88f437d5185b11ca82e8cbf65e  patches/tool-parser-utils.dsml-orphan.py
  071b0dc3a4d2145bccc3fb991d6039df8d03a61998d9675f85c6cdb1d233ab41  patches/triton-kernels-matmul-ogs-opt-flags.dsv4-mi300x.py
  0db66e985b78bd21b3bf4256fc57335880edc97f5be2e4b2fad20ea3497e6a09  patches/tiering-fs-bounded-lru.py
- c76089967178a226a8d8b614a067bd7599b5f031dcceaca670611b3a3dfa87be  patches/tiering-fs-manager.disk-reserve.py
+ 89de0df21b3b404d8d3243ffda758df24b7b860093af69eb5a73d2612272faeb  patches/tiering-fs-manager.disk-reserve.py
+ 2930f003efdad0371330c3b43c013cd174b85f58aac592dc26a0e032316dc0c7  patches/async_lookup.bounded.py
+ 4e950468c1f4ae4fef212ea4a3cb93932bc2e429c9f70e1975d23ee2e08970e6  patches/kv_lookup_fail_open.py
  770283606df45aae4e933d69f730b5a3fa2827a99f1c0995b899dd3fff310d00  patches/apply-deepseek-v4-reasoning-effort.py
  8f73eecf8f7d9f02035401f05d7c0f89aed5780e2fb97a90395f9d28ad544073  patches/diffs/01-gpt_oss_triton_kernels_moe.pack128-fused-silu-fast-routing.patch
  65a34531073bc5dca79e5dead3a329499aa4a510906c030bc5a74fac92c2e060  patches/diffs/02-mxfp4.fused-silu.patch
@@ -36,5 +38,6 @@ cfdb52c43abc036e7d2e2b03b5dd5bad5145e5a969329a07435c582bb3ea8bd0  compose.tp2.ya
  ded4e60292502d401a57332b0c661f874a8af4f34c1dd7451b66891b80c60af1  patches/diffs/11-structural-tag-registry.deepseek-v4-auto.patch
  c63a700f16291b0648489c309dbcb2aa2aaa901aa774c22486822ba1c274af4d  patches/diffs/12-deepseek-dsml-orphan-recovery.patch
  90c661e4f74f10a9b786d9ab763a688ea4b4fc9910dd75e88725f01c75ad0b73  patches/diffs/13-tiering-fs-manager.disk-reserve.patch
+ e72b82b29739ed7a23321e4ba78a4982da7d86819a923e3f697a1f4a7b065a7f  patches/diffs/14-kv-cache-fail-open.patch
  579eabf2e06fd8d80c7919abbbe66deeddc53a4ba9ae47c263f4ffff6c7575c8  tuning/dsv4-a8w8-blockscale-tuned-gemm.mi300x.prefill-m2688.csv
  0e58ab9227261eb742db5da5eca70c46172ed6ea22b56ababac83f9a95d15bc9  tuning/dsv4-mi300x-a8w8-blockscale-bpreshuffle-ck.prefill-m2688.csv

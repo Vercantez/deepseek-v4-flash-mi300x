@@ -26,6 +26,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
     _ConnectorMetricName,
     _TransferMetricName,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.kv_lookup_fail_open import (
+    LookupFailOpenPolicy,
+)
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv, round_down
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
@@ -55,6 +58,7 @@ from vllm.v1.kv_offload.base import (
 )
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request, RequestStatus
+from vllm.v1.kv_offload.tiering.fs.manager import FileSystemTierMetrics
 
 logger = init_logger(__name__)
 
@@ -307,6 +311,9 @@ class RequestOffloadState:
     # time.monotonic() of this request's first deferred offload lookup;
     # None once consumed (observed) or while no lookup is pending.
     deferred_lookup_start_time: float | None = None
+    # Once a secondary lookup exceeds its availability budget, this request
+    # computes its missing prefix locally. GPU prefix hits remain intact.
+    external_lookup_bypassed: bool = False
     # True once on_request_finished has been signaled to the manager.
     finished_signaled: bool = False
     # DSpark draft groups excluded by the latest successful external lookup.
@@ -481,6 +488,28 @@ class OffloadingConnectorScheduler:
         )
         self.manager: OffloadingManager = spec.get_manager()
         self._connector_stats = OffloadingConnectorStats()
+        transfer_config = vllm_config.kv_transfer_config
+        extra_config = (
+            transfer_config.kv_connector_extra_config
+            if transfer_config is not None
+            else {}
+        )
+        self._lookup_fail_open = LookupFailOpenPolicy(
+            timeout_seconds=float(extra_config.get("lookup_timeout_seconds", 0.1)),
+            circuit_breaker_seconds=float(
+                extra_config.get("lookup_circuit_breaker_seconds", 30)
+            ),
+            timeout_threshold=int(
+                extra_config.get("lookup_timeout_threshold", 3)
+            ),
+        )
+        logger.info(
+            "External KV lookup fail-open enabled: %.3fs deadline, %d timeouts, "
+            "%.1fs circuit breaker",
+            self._lookup_fail_open.timeout_seconds,
+            self._lookup_fail_open.timeout_threshold,
+            self._lookup_fail_open.circuit_breaker_seconds,
+        )
 
         full_attention_groups: list[int] = []
         sliding_window_groups: list[int] = []
@@ -905,8 +934,25 @@ class OffloadingConnectorScheduler:
         req_status.num_locally_computed_tokens = num_computed_tokens
 
         num_hit_tokens: int | None
-        if request.skip_reading_prefix_cache:
+        request_id = request.request_id
+        bypass_reason = None
+        if (
+            not request.skip_reading_prefix_cache
+            and not req_status.external_lookup_bypassed
+        ):
+            bypass_reason = self._lookup_fail_open.bypass_reason(
+                request_id, time.monotonic()
+            )
+        if request.skip_reading_prefix_cache or req_status.external_lookup_bypassed:
             num_hit_tokens = 0
+        elif bypass_reason is not None:
+            req_status.external_lookup_bypassed = True
+            num_hit_tokens = 0
+            logger.warning(
+                "Failing open external KV lookup for request %s (%s)",
+                request_id,
+                bypass_reason,
+            )
         else:
             lookup_start = time.monotonic()
             num_hit_tokens = self._lookup(req_status)
@@ -917,7 +963,26 @@ class OffloadingConnectorScheduler:
             if num_hit_tokens is None:
                 if req_status.deferred_lookup_start_time is None:
                     req_status.deferred_lookup_start_time = lookup_start
+                self._lookup_fail_open.defer(
+                    request_id, req_status.deferred_lookup_start_time
+                )
+                bypass_reason = self._lookup_fail_open.bypass_reason(
+                    request_id, time.monotonic()
+                )
+                if bypass_reason is not None:
+                    waited = time.monotonic() - req_status.deferred_lookup_start_time
+                    req_status.external_lookup_bypassed = True
+                    num_hit_tokens = 0
+                    self._maybe_observe_lookup_async_delay(req_status)
+                    logger.warning(
+                        "External KV lookup for request %s exceeded its %.3fs "
+                        "availability budget after %.3fs; computing locally",
+                        request_id,
+                        self._lookup_fail_open.timeout_seconds,
+                        waited,
+                    )
             else:
+                self._lookup_fail_open.resolve(request_id)
                 self._maybe_observe_lookup_async_delay(req_status)
         req_status.update_num_hit_chunks(num_computed_tokens + (num_hit_tokens or 0))
 
@@ -1420,6 +1485,30 @@ class OffloadingConnectorScheduler:
                 del self._req_status[job_status.req_id]
 
     def get_stats(self) -> OffloadingConnectorStats | None:
+        fail_open = self._lookup_fail_open.snapshot(
+            time.monotonic(), reset_counters=True
+        )
+        if fail_open.timeout_total:
+            self._connector_stats.increase_counter(
+                FileSystemTierMetrics.REQUEST_TIMEOUT, fail_open.timeout_total
+            )
+        if fail_open.circuit_bypass_total:
+            self._connector_stats.increase_counter(
+                FileSystemTierMetrics.CIRCUIT_BYPASS,
+                fail_open.circuit_bypass_total,
+            )
+        self._connector_stats.set_gauge(
+            FileSystemTierMetrics.DEFERRED_REQUESTS,
+            fail_open.deferred_requests,
+        )
+        self._connector_stats.set_gauge(
+            FileSystemTierMetrics.OLDEST_DEFERRED,
+            fail_open.oldest_deferred_seconds,
+        )
+        self._connector_stats.set_gauge(
+            FileSystemTierMetrics.CIRCUIT_OPEN,
+            int(fail_open.circuit_open),
+        )
         stats: OffloadingConnectorStats | None = None
         if not self._connector_stats.is_empty():
             stats = self._connector_stats
@@ -1449,6 +1538,7 @@ class OffloadingConnectorScheduler:
             returned by the engine.
         """
         req_status = self._req_status.get(request.request_id)
+        self._lookup_fail_open.finish(request.request_id)
 
         if req_status is None:
             # Untracked request (offloading never started): no in-flight jobs,
