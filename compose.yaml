@@ -115,7 +115,10 @@ services:
       timeout: 5s
       retries: 5
       start_period: 6m
-    stop_grace_period: 2m
+    # vLLM waits for active streams during graceful shutdown. Keep deploys
+    # bounded so one stuck generation cannot prevent the replacement from
+    # starting; the public Worker retries through OpenRouter.
+    stop_grace_period: 15s
     logging:
       options:
         max-size: 100m
