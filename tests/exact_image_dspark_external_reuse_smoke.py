@@ -73,6 +73,7 @@ def main() -> None:
     connector._mamba_align_size = None
     connector._chunks_being_loaded = None
     connector._events_tracker = SimpleNamespace(record_lookup=lambda *args: None)
+    connector._stores_enabled = True
 
     req = SimpleNamespace(
         request_id="req",
@@ -113,6 +114,13 @@ def main() -> None:
     )
     assert connector._build_store_jobs(output) == {}
     assert manager.store_keys == ["target-0", "target-1"]
+
+    # Read-only cache mode must leave lookup/load behavior intact while never
+    # constructing a GPU->host transfer or touching the manager's store path.
+    manager.store_keys = None
+    connector._stores_enabled = False
+    assert connector._build_store_jobs(output) == {}
+    assert manager.store_keys is None
     print("exact-image DSpark external-reuse exclusion smoke: PASS")
 
 

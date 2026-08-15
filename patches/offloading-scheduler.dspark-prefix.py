@@ -510,6 +510,12 @@ class OffloadingConnectorScheduler:
             self._lookup_fail_open.timeout_threshold,
             self._lookup_fail_open.circuit_breaker_seconds,
         )
+        self._stores_enabled = bool(extra_config.get("stores_enabled", True))
+        if not self._stores_enabled:
+            logger.warning(
+                "External KV stores are disabled; existing CPU/filesystem "
+                "cache entries remain readable"
+            )
 
         full_attention_groups: list[int] = []
         sliding_window_groups: list[int] = []
@@ -1156,6 +1162,12 @@ class OffloadingConnectorScheduler:
         self,
         scheduler_output: SchedulerOutput,
     ) -> dict[int, TransferJob]:
+        # TP workers can still read an existing shared CPU/filesystem cache
+        # while GPU->host writes are disabled. This is a fail-safe for ROCm
+        # hosts where a store DMA fault would otherwise kill the whole engine.
+        if not self._stores_enabled:
+            return {}
+
         blocks_per_chunk = self.config.blocks_per_chunk
         store_jobs: dict[int, TransferJob] = {}
         for req_id in chain(

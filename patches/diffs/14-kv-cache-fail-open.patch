@@ -392,7 +392,7 @@ index 0000000..a371d7b
 +            self._circuit_bypass_delta = 0
 +        return snapshot
 diff --git a/patches/offloading-scheduler.dspark-prefix.py b/patches/offloading-scheduler.dspark-prefix.py
-index 0eebb5f..8c8dffa 100644
+index 0eebb5f..998beef 100644
 --- a/patches/offloading-scheduler.dspark-prefix.py
 +++ b/patches/offloading-scheduler.dspark-prefix.py
 @@ -26,6 +26,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
@@ -423,7 +423,7 @@ index 0eebb5f..8c8dffa 100644
      # True once on_request_finished has been signaled to the manager.
      finished_signaled: bool = False
      # DSpark draft groups excluded by the latest successful external lookup.
-@@ -481,6 +488,28 @@ class OffloadingConnectorScheduler:
+@@ -481,6 +488,34 @@ class OffloadingConnectorScheduler:
          )
          self.manager: OffloadingManager = spec.get_manager()
          self._connector_stats = OffloadingConnectorStats()
@@ -449,10 +449,16 @@ index 0eebb5f..8c8dffa 100644
 +            self._lookup_fail_open.timeout_threshold,
 +            self._lookup_fail_open.circuit_breaker_seconds,
 +        )
++        self._stores_enabled = bool(extra_config.get("stores_enabled", True))
++        if not self._stores_enabled:
++            logger.warning(
++                "External KV stores are disabled; existing CPU/filesystem "
++                "cache entries remain readable"
++            )
  
          full_attention_groups: list[int] = []
          sliding_window_groups: list[int] = []
-@@ -905,8 +934,29 @@ class OffloadingConnectorScheduler:
+@@ -905,8 +940,29 @@ class OffloadingConnectorScheduler:
          req_status.num_locally_computed_tokens = num_computed_tokens
  
          num_hit_tokens: int | None
@@ -483,7 +489,7 @@ index 0eebb5f..8c8dffa 100644
          else:
              lookup_start = time.monotonic()
              num_hit_tokens = self._lookup(req_status)
-@@ -917,7 +967,29 @@ class OffloadingConnectorScheduler:
+@@ -917,7 +973,29 @@ class OffloadingConnectorScheduler:
              if num_hit_tokens is None:
                  if req_status.deferred_lookup_start_time is None:
                      req_status.deferred_lookup_start_time = lookup_start
@@ -513,7 +519,20 @@ index 0eebb5f..8c8dffa 100644
                  self._maybe_observe_lookup_async_delay(req_status)
          req_status.update_num_hit_chunks(num_computed_tokens + (num_hit_tokens or 0))
  
-@@ -1420,6 +1492,30 @@ class OffloadingConnectorScheduler:
+@@ -1084,6 +1162,12 @@ class OffloadingConnectorScheduler:
+         self,
+         scheduler_output: SchedulerOutput,
+     ) -> dict[int, TransferJob]:
++        # TP workers can still read an existing shared CPU/filesystem cache
++        # while GPU->host writes are disabled. This is a fail-safe for ROCm
++        # hosts where a store DMA fault would otherwise kill the whole engine.
++        if not self._stores_enabled:
++            return {}
++
+         blocks_per_chunk = self.config.blocks_per_chunk
+         store_jobs: dict[int, TransferJob] = {}
+         for req_id in chain(
+@@ -1420,6 +1504,30 @@ class OffloadingConnectorScheduler:
                  del self._req_status[job_status.req_id]
  
      def get_stats(self) -> OffloadingConnectorStats | None:
@@ -544,7 +563,7 @@ index 0eebb5f..8c8dffa 100644
          stats: OffloadingConnectorStats | None = None
          if not self._connector_stats.is_empty():
              stats = self._connector_stats
-@@ -1449,6 +1545,7 @@ class OffloadingConnectorScheduler:
+@@ -1449,6 +1557,7 @@ class OffloadingConnectorScheduler:
              returned by the engine.
          """
          req_status = self._req_status.get(request.request_id)

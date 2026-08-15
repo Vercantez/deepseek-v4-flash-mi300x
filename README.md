@@ -74,6 +74,14 @@ The stack uses a digest-pinned official vLLM ROCm nightly with:
 
 One MI300X (`gfx942`, 304 CUs, ~192 GiB HBM), a working AMD kernel driver, recent Docker Compose, ~235 GiB RAM for the CPU KV tier, and ~500 GB disk (the model cache alone is ~156 GB).
 
+The TP2 override keeps reads from its existing CPU/filesystem KV cache enabled
+but disables new GPU-to-host cache stores. On this ROCm host, both observed TP2
+engine failures were simultaneous GPU memory-access faults while connector
+metadata contained store jobs and no load jobs; one was explicitly a write to
+a read-only host page. Read-only cache mode removes that engine-killing DMA
+direction while preserving filesystem cache fulfills. The single-GPU override
+continues normal cache reads and writes.
+
 ### 2. Pull the pinned runtime and model
 
 ```bash
