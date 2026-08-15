@@ -94,7 +94,7 @@ services:
       - --kv-offloading-backend
       - native
       - --kv-transfer-config
-      - '{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"spec_name":"TieringOffloadingSpec","lookup_timeout_seconds":0.1,"lookup_timeout_threshold":3,"lookup_circuit_breaker_seconds":30,"secondary_tiers":[{"type":"fs","root_dir":"/var/cache/vllm-kv","n_read_threads":16,"n_write_threads":16,"locality":"LOCAL","min_free_gb":2048,"space_check_interval_seconds":1,"eviction_trigger_free_gb":2560,"eviction_target_free_gb":3072,"shard_touch_interval_seconds":30,"max_pending_lookup_batches":8,"max_lookup_keys_per_step":16384}]}}'
+      - '{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"spec_name":"TieringOffloadingSpec","lookup_timeout_seconds":0.1,"lookup_timeout_threshold":1,"lookup_circuit_breaker_seconds":5,"secondary_tiers":[{"type":"fs","root_dir":"/var/cache/vllm-kv","n_read_threads":16,"n_write_threads":16,"locality":"LOCAL","min_free_gb":2048,"space_check_interval_seconds":1,"eviction_trigger_free_gb":2560,"eviction_target_free_gb":3072,"shard_touch_interval_seconds":30,"max_pending_lookup_batches":8,"max_lookup_keys_per_step":16384}]}}'
       - --max-num-seqs
       - "64"
       - --max-num-batched-tokens

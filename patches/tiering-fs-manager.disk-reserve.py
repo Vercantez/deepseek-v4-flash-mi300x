@@ -158,7 +158,8 @@ class FileSystemTierManager(SecondaryTierManager):
                 "Requests that treated external KV as a miss after its deadline."
             ),
             FileSystemTierMetrics.CIRCUIT_BYPASS: (
-                "Requests that bypassed external KV while its circuit was open."
+                "Requests that bypassed external KV while storage was unavailable "
+                "or another metadata probe was in flight."
             ),
             FileSystemTierMetrics.QUEUE_DROPPED_KEYS: (
                 "Filesystem lookup keys dropped as misses to keep queues bounded."

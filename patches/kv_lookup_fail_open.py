@@ -60,12 +60,19 @@ class LookupFailOpenPolicy:
         return "deadline"
 
     def circuit_bypass_reason(self, request_id: str, now: float) -> str | None:
-        """Bypass new work while the circuit is open without testing a deadline."""
-        if now >= self._circuit_open_until:
-            return None
-        self._deferred.pop(request_id, None)
-        self._circuit_bypass_delta += 1
-        return "circuit_open"
+        """Bypass new work while storage is unavailable or already being probed."""
+        if now < self._circuit_open_until:
+            self._deferred.pop(request_id, None)
+            self._circuit_bypass_delta += 1
+            return "circuit_open"
+        # A single metadata request can contain thousands of block paths. Let
+        # one request probe the filesystem while concurrent requests compute
+        # locally; otherwise a post-restart burst can park the entire engine
+        # before the first probe has a chance to trip the circuit breaker.
+        if self._deferred and request_id not in self._deferred:
+            self._circuit_bypass_delta += 1
+            return "lookup_in_flight"
+        return None
 
     def defer(self, request_id: str, started_at: float) -> None:
         """Start a request deadline without moving it on later scheduler ticks."""

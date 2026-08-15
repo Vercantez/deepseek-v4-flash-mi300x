@@ -55,6 +55,20 @@ class LookupFailOpenPolicyTests(unittest.TestCase):
         self.assertEqual(snapshot.timeout_total, 0)
         self.assertEqual(snapshot.deferred_requests, 0)
 
+    def test_only_one_request_can_probe_filesystem_metadata(self) -> None:
+        policy = module.LookupFailOpenPolicy(timeout_seconds=0.1)
+        policy.defer("probe", 10.0)
+
+        self.assertIsNone(policy.circuit_bypass_reason("probe", 10.01))
+        self.assertEqual(
+            policy.circuit_bypass_reason("concurrent", 10.01),
+            "lookup_in_flight",
+        )
+        self.assertEqual(policy.snapshot(10.01).circuit_bypass_total, 1)
+
+        policy.resolve("probe")
+        self.assertIsNone(policy.circuit_bypass_reason("next", 10.02))
+
     def test_finish_cancels_deadline_and_counters_are_delta_based(self) -> None:
         policy = module.LookupFailOpenPolicy(timeout_seconds=0.1)
         policy.defer("finished", 1.0)

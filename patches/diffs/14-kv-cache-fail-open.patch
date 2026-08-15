@@ -284,10 +284,10 @@ index 0000000..f329bc7
 +                self._pending_results.put(results)
 diff --git a/patches/kv_lookup_fail_open.py b/patches/kv_lookup_fail_open.py
 new file mode 100644
-index 0000000..0af8a3e
+index 0000000..a371d7b
 --- /dev/null
 +++ b/patches/kv_lookup_fail_open.py
-@@ -0,0 +1,96 @@
+@@ -0,0 +1,103 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""Bounded, fail-open policy for optional external KV-cache lookups.
 +
@@ -350,12 +350,19 @@ index 0000000..0af8a3e
 +        return "deadline"
 +
 +    def circuit_bypass_reason(self, request_id: str, now: float) -> str | None:
-+        """Bypass new work while the circuit is open without testing a deadline."""
-+        if now >= self._circuit_open_until:
-+            return None
-+        self._deferred.pop(request_id, None)
-+        self._circuit_bypass_delta += 1
-+        return "circuit_open"
++        """Bypass new work while storage is unavailable or already being probed."""
++        if now < self._circuit_open_until:
++            self._deferred.pop(request_id, None)
++            self._circuit_bypass_delta += 1
++            return "circuit_open"
++        # A single metadata request can contain thousands of block paths. Let
++        # one request probe the filesystem while concurrent requests compute
++        # locally; otherwise a post-restart burst can park the entire engine
++        # before the first probe has a chance to trip the circuit breaker.
++        if self._deferred and request_id not in self._deferred:
++            self._circuit_bypass_delta += 1
++            return "lookup_in_flight"
++        return None
 +
 +    def defer(self, request_id: str, started_at: float) -> None:
 +        """Start a request deadline without moving it on later scheduler ticks."""
@@ -546,7 +553,7 @@ index 0eebb5f..8c8dffa 100644
          if req_status is None:
              # Untracked request (offloading never started): no in-flight jobs,
 diff --git a/patches/tiering-fs-manager.disk-reserve.py b/patches/tiering-fs-manager.disk-reserve.py
-index 94c4663..d5b5982 100644
+index 94c4663..0ddf8cf 100644
 --- a/patches/tiering-fs-manager.disk-reserve.py
 +++ b/patches/tiering-fs-manager.disk-reserve.py
 @@ -33,11 +33,17 @@ except ImportError:
@@ -607,7 +614,7 @@ index 94c4663..d5b5982 100644
          self._tier = tier
  
      def batch_lookup(
-@@ -120,6 +149,59 @@ class FileSystemTierManager(SecondaryTierManager):
+@@ -120,6 +149,60 @@ class FileSystemTierManager(SecondaryTierManager):
  
      medium: ClassVar[Medium] = Medium.STORAGE
  
@@ -620,7 +627,8 @@ index 94c4663..d5b5982 100644
 +                "Requests that treated external KV as a miss after its deadline."
 +            ),
 +            FileSystemTierMetrics.CIRCUIT_BYPASS: (
-+                "Requests that bypassed external KV while its circuit was open."
++                "Requests that bypassed external KV while storage was unavailable "
++                "or another metadata probe was in flight."
 +            ),
 +            FileSystemTierMetrics.QUEUE_DROPPED_KEYS: (
 +                "Filesystem lookup keys dropped as misses to keep queues bounded."
@@ -667,7 +675,7 @@ index 94c4663..d5b5982 100644
      def __init__(
          self,
          offloading_spec: "OffloadingSpec",
-@@ -135,6 +217,8 @@ class FileSystemTierManager(SecondaryTierManager):
+@@ -135,6 +218,8 @@ class FileSystemTierManager(SecondaryTierManager):
          eviction_trigger_free_gb: float = 0,
          eviction_target_free_gb: float = 0,
          shard_touch_interval_seconds: float = 30,
@@ -676,7 +684,7 @@ index 94c4663..d5b5982 100644
      ):
          """
          Args:
-@@ -162,6 +246,10 @@ class FileSystemTierManager(SecondaryTierManager):
+@@ -162,6 +247,10 @@ class FileSystemTierManager(SecondaryTierManager):
                  space is restored. Must be at least the trigger.
              shard_touch_interval_seconds: Minimum interval between persisting
                  a shard's LRU timestamp to its directory mtime.
@@ -687,7 +695,7 @@ index 94c4663..d5b5982 100644
          """
          super().__init__(offloading_spec, primary_kv_view, tier_type)
          if min_free_gb < 0:
-@@ -182,6 +270,8 @@ class FileSystemTierManager(SecondaryTierManager):
+@@ -182,6 +271,8 @@ class FileSystemTierManager(SecondaryTierManager):
              )
          if shard_touch_interval_seconds < 0:
              raise ValueError("shard_touch_interval_seconds must be non-negative")
@@ -696,7 +704,7 @@ index 94c4663..d5b5982 100644
          self._root_dir = root_dir
          self._min_free_bytes = int(min_free_gb * 1024**3)
          self._eviction_trigger_bytes = int(eviction_trigger_free_gb * 1024**3)
-@@ -196,6 +286,8 @@ class FileSystemTierManager(SecondaryTierManager):
+@@ -196,6 +287,8 @@ class FileSystemTierManager(SecondaryTierManager):
          self._store_job_reserved_bytes: dict[JobId, int] = {}
          self._eviction_active = False
          self._last_no_evictable_log = 0.0
@@ -705,7 +713,7 @@ index 94c4663..d5b5982 100644
          self.locality = Locality(locality) if locality is not None else None
  
          self.events: list[OffloadingEvent] | None = None
-@@ -253,6 +345,7 @@ class FileSystemTierManager(SecondaryTierManager):
+@@ -253,6 +346,7 @@ class FileSystemTierManager(SecondaryTierManager):
                          self._eviction_worker.submit(entry.path)
          self._store_job_paths: dict[JobId, list[str]] = {}
          self._load_job_paths: dict[JobId, list[str]] = {}
@@ -713,7 +721,7 @@ index 94c4663..d5b5982 100644
  
          # Prefer O_DIRECT to bypass the page cache, but fall back to buffered
          # I/O on filesystems that reject it (e.g. overlayfs, some NFS mounts)
-@@ -272,7 +365,12 @@ class FileSystemTierManager(SecondaryTierManager):
+@@ -272,7 +366,12 @@ class FileSystemTierManager(SecondaryTierManager):
              thread_name_prefix="vllm_kv_py_fs",
          )
  
@@ -727,7 +735,7 @@ index 94c4663..d5b5982 100644
  
      @override
      def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
-@@ -424,9 +522,12 @@ class FileSystemTierManager(SecondaryTierManager):
+@@ -424,9 +523,12 @@ class FileSystemTierManager(SecondaryTierManager):
      def submit_load(self, job_metadata: JobMetadata) -> None:
          paths = [self.file_mapper.get_file_name(key) for key in job_metadata.keys]
          if not self._leases.pin_job(job_metadata.job_id, paths):
@@ -740,7 +748,7 @@ index 94c4663..d5b5982 100644
          task = functools.partial(
              batch_load_block,
              paths,
-@@ -440,6 +541,7 @@ class FileSystemTierManager(SecondaryTierManager):
+@@ -440,6 +542,7 @@ class FileSystemTierManager(SecondaryTierManager):
              self._pool.enqueue_load(job_metadata.job_id, 1, [task])
          except Exception:
              self._load_job_paths.pop(job_metadata.job_id, None)
@@ -748,7 +756,7 @@ index 94c4663..d5b5982 100644
              self._leases.release_job(job_metadata.job_id)
              raise
  
-@@ -457,6 +559,7 @@ class FileSystemTierManager(SecondaryTierManager):
+@@ -457,6 +560,7 @@ class FileSystemTierManager(SecondaryTierManager):
          for job_id, success in self._pool.get_finished():
              store_paths = self._store_job_paths.pop(job_id, None)
              load_paths = self._load_job_paths.pop(job_id, None)
@@ -756,7 +764,7 @@ index 94c4663..d5b5982 100644
              reserved_bytes = self._store_job_reserved_bytes.pop(job_id, 0)
              self._reserved_store_bytes -= reserved_bytes
              self._leases.release_job(job_id)
-@@ -464,6 +567,12 @@ class FileSystemTierManager(SecondaryTierManager):
+@@ -464,6 +568,12 @@ class FileSystemTierManager(SecondaryTierManager):
                  self._leases.record_store(store_paths)
              if success and load_paths:
                  self._leases.record_access(load_paths)
@@ -769,7 +777,7 @@ index 94c4663..d5b5982 100644
              if self.events is not None:
                  keys = self._store_job_keys.pop(job_id, None)
                  if success and keys:
-@@ -478,6 +587,40 @@ class FileSystemTierManager(SecondaryTierManager):
+@@ -478,6 +588,40 @@ class FileSystemTierManager(SecondaryTierManager):
              results.append(JobResult(job_id=job_id, success=success))
          return results
  
