@@ -32,12 +32,70 @@ from vllm.v1.kv_offload.cpu.swap_blocks_triton import (
 
 logger = init_logger(__name__)
 
+_HIP_MEMCPY_DEFAULT = 4
+_hip_runtime = None
+_hip_memcpy_async = None
+
+
+def _swap_blocks_rocm_stream_ordered(
+    src_ptrs: torch.Tensor,
+    dst_ptrs: torch.Tensor,
+    sizes: torch.Tensor,
+    is_src_access_order_any: bool = False,
+) -> None:
+    """Submit ROCm KV copies individually on the current transfer stream.
+
+    ROCm 7.2's ``hipMemcpyBatchAsync`` has produced fatal host-memory access
+    faults on both ranks of the TP2 worker while writing pinned staging
+    buffers. The ordinary async-copy API is the established vLLM fallback on
+    ROCm < 7.1 and preserves stream ordering without exposing the mmap itself
+    to a GPU DMA engine.
+    """
+    del is_src_access_order_any  # HIP's batch implementation ignores this too.
+    global _hip_runtime, _hip_memcpy_async
+    if _hip_memcpy_async is None:
+        _hip_runtime = ctypes.CDLL("libamdhip64.so")
+        _hip_memcpy_async = _hip_runtime.hipMemcpyAsync
+        _hip_memcpy_async.argtypes = (
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_int,
+            ctypes.c_void_p,
+        )
+        _hip_memcpy_async.restype = ctypes.c_int
+
+    sources = src_ptrs.numpy()
+    destinations = dst_ptrs.numpy()
+    copy_sizes = sizes.numpy()
+    stream = current_platform.current_stream()
+    stream_ptr = ctypes.c_void_p(stream.cuda_stream)
+    for idx, (source, destination, size) in enumerate(
+        zip(sources, destinations, copy_sizes)
+    ):
+        result = _hip_memcpy_async(
+            ctypes.c_void_p(int(destination)),
+            ctypes.c_void_p(int(source)),
+            ctypes.c_size_t(int(size)),
+            _HIP_MEMCPY_DEFAULT,
+            stream_ptr,
+        )
+        if result != 0:
+            raise RuntimeError(
+                f"hipMemcpyAsync failed at KV descriptor {idx} with error {result}"
+            )
+
 
 def _select_swap_blocks_fn(
     kv_cache_groups_data_refs: list[list[CanonicalKVCacheRef]],
     gpu_to_cpu: bool,
 ):
     """Resolve the swap_blocks function for a handler at init time."""
+    # hipMemcpyBatchAsync in ROCm 7.2 has faulted on pinned host destinations
+    # during real TP2 offload stores. Use the driver's ordinary stream-ordered
+    # async copy path for both directions instead.
+    if current_platform.is_rocm():
+        return _swap_blocks_rocm_stream_ordered
     # GPU->CPU is bandwidth-bound; the dedicated copy engine beats Triton.
     if gpu_to_cpu:
         return ops.swap_blocks_batch
@@ -45,7 +103,7 @@ def _select_swap_blocks_fn(
     # (e.g. ROCm host mappings) or where GPU kernels cannot directly
     # dereference CPU pointers (XPU lacks CUDA's unified virtual address space,
     # so the Triton kernel's tl.load(cpu_ptr) is invalid on XPU).
-    if not HAS_TRITON or current_platform.is_xpu() or current_platform.is_rocm():
+    if not HAS_TRITON or current_platform.is_xpu():
         return ops.swap_blocks_batch
     page_sizes = [r.page_size_bytes for g in kv_cache_groups_data_refs for r in g]
     # Triton wins only on small, 8-byte-aligned payloads.
