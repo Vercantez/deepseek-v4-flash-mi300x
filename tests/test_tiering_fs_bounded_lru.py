@@ -88,6 +88,56 @@ class ShardLeaseIndexTests(unittest.TestCase):
 
         self.assertEqual(lookup_result, [True])
 
+    def test_cancelled_lookup_cannot_repin_after_disk_io_finishes(self) -> None:
+        path = self.make_block("abc")
+        index = bounded_lru.ShardLeaseIndex(str(self.root))
+        index.open_request("req")
+        lookup_started = threading.Event()
+        release_lookup = threading.Event()
+        lookup_result: list[bool] = []
+
+        def slow_exists(paths: list[str]) -> list[bool]:
+            lookup_started.set()
+            self.assertTrue(release_lookup.wait(5))
+            return [True for _ in paths]
+
+        lookup_thread = threading.Thread(
+            target=lambda: lookup_result.extend(
+                index.lookup_and_pin("req", [path], slow_exists)
+            )
+        )
+        lookup_thread.start()
+        self.assertTrue(lookup_started.wait(5))
+        index.cancel_lookup("req")
+        release_lookup.set()
+        lookup_thread.join(5)
+
+        self.assertEqual(lookup_result, [False])
+        self.assertEqual(index.begin_oldest_eviction(), self.shard_path("abc"))
+
+    def test_pending_lookup_metadata_is_compact_per_shard(self) -> None:
+        paths = [self.make_block("abc", f"block-{index}.bin") for index in range(50)]
+        index = bounded_lru.ShardLeaseIndex(str(self.root))
+        index.open_request("req")
+        lookup_started = threading.Event()
+        release_lookup = threading.Event()
+
+        def slow_exists(candidate_paths: list[str]) -> list[bool]:
+            lookup_started.set()
+            self.assertTrue(release_lookup.wait(5))
+            return [False for _ in candidate_paths]
+
+        lookup_thread = threading.Thread(
+            target=lambda: index.lookup_and_pin("req", paths, slow_exists)
+        )
+        lookup_thread.start()
+        self.assertTrue(lookup_started.wait(5))
+        pending = index._pending_lookup_shards["req"]
+        self.assertEqual(pending, {self.shard_path("abc"): 50})
+        release_lookup.set()
+        lookup_thread.join(5)
+        self.assertNotIn("req", index._pending_lookup_shards)
+
     def test_jobs_and_cancelled_requests_fence_eviction(self) -> None:
         path = self.make_block("abc")
         index = bounded_lru.ShardLeaseIndex(str(self.root))

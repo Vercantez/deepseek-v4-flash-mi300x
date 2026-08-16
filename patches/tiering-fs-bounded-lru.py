@@ -33,7 +33,10 @@ class ShardLeaseIndex:
         self._lock = threading.RLock()
         self._last_used: dict[str, float] = {}
         self._request_shards: dict[str, set[str]] = {}
-        self._pending_lookup_paths: dict[str, set[str]] = {}
+        # Eviction operates on 4,096 hash shards, so tracking millions of
+        # individual candidate paths only wastes memory and lock time. Counts
+        # preserve correctness when concurrent batches touch the same shard.
+        self._pending_lookup_shards: dict[str, dict[str, int]] = {}
         self._job_shards: dict[int, set[str]] = {}
         self._evicting: set[str] = set()
         self._dirty_shards: set[str] = set()
@@ -41,6 +44,7 @@ class ShardLeaseIndex:
         # A bounded cancellation fence prevents a late async lookup result
         # from re-leasing a request after cleanup.
         self._closed_requests: OrderedDict[str, None] = OrderedDict()
+        self._lookup_cancelled_requests: set[str] = set()
         self._scan_shards()
 
     def _scan_shards(self) -> None:
@@ -98,66 +102,85 @@ class ShardLeaseIndex:
     ) -> list[bool]:
         """Check paths and lease positive results before eviction can begin."""
         with self._lock:
-            if req_id in self._closed_requests:
+            if (
+                req_id in self._closed_requests
+                or req_id in self._lookup_cancelled_requests
+            ):
                 return [False] * len(paths)
             normalized_paths = [self._normalize_path(path) for path in paths]
             shards = [
                 self._shard_for_normalized_path(path) for path in normalized_paths
             ]
             eligible = [shard not in self._evicting for shard in shards]
-            pending = self._pending_lookup_paths.setdefault(req_id, set())
-            pending.update(normalized_paths)
+            pending = self._pending_lookup_shards.setdefault(req_id, {})
+            for shard, ok in zip(shards, eligible):
+                if ok:
+                    pending[shard] = pending.get(shard, 0) + 1
         candidate_paths = [path for path, ok in zip(paths, eligible) if ok]
+        candidate_shards = [shard for shard, ok in zip(shards, eligible) if ok]
         try:
             candidate_hits = iter(exists(candidate_paths))
             hits = [next(candidate_hits) if ok else False for ok in eligible]
         except Exception:
             with self._lock:
-                pending = self._pending_lookup_paths.get(req_id)
-                if pending is not None:
-                    pending.difference_update(normalized_paths)
-                    if not pending:
-                        self._pending_lookup_paths.pop(req_id, None)
+                self._release_pending_shards_locked(req_id, candidate_shards)
             raise
         with self._lock:
-            if req_id in self._closed_requests:
+            self._release_pending_shards_locked(req_id, candidate_shards)
+            if (
+                req_id in self._closed_requests
+                or req_id in self._lookup_cancelled_requests
+            ):
                 return [False] * len(paths)
             now = time.time()
             pinned = self._request_shards.setdefault(req_id, set())
-            pending = self._pending_lookup_paths.get(req_id)
-            for normalized_path, shard, hit in zip(normalized_paths, shards, hits):
-                if pending is not None:
-                    pending.discard(normalized_path)
+            for shard, hit in zip(shards, hits):
                 if not hit:
                     continue
                 pinned.add(shard)
                 self._last_used[shard] = now
                 self._dirty_shards.add(shard)
-            if pending is not None and not pending:
-                self._pending_lookup_paths.pop(req_id, None)
             return hits
 
+    def _release_pending_shards_locked(
+        self, req_id: str, shards: Iterable[str]
+    ) -> None:
+        pending = self._pending_lookup_shards.get(req_id)
+        if pending is None:
+            return
+        for shard in shards:
+            remaining = pending.get(shard, 0) - 1
+            if remaining > 0:
+                pending[shard] = remaining
+            else:
+                pending.pop(shard, None)
+        if not pending:
+            self._pending_lookup_shards.pop(req_id, None)
+
     def begin_lookup(self, req_id: str, path: str) -> None:
-        """Protect a path while its asynchronous existence check is queued."""
+        """Protect a path's shard while an existence check is queued."""
         with self._lock:
-            if req_id in self._closed_requests:
+            if (
+                req_id in self._closed_requests
+                or req_id in self._lookup_cancelled_requests
+            ):
                 return
-            self._pending_lookup_paths.setdefault(req_id, set()).add(
-                self._normalize_path(path)
-            )
+            shard = self.shard_for_path(path)
+            pending = self._pending_lookup_shards.setdefault(req_id, {})
+            pending[shard] = pending.get(shard, 0) + 1
 
     def resolve_cached_lookup(self, req_id: str, path: str, hit: bool) -> bool:
         """Resolve and optionally lease a result cached for another request."""
         shard = self.shard_for_path(path)
         with self._lock:
-            pending = self._pending_lookup_paths.get(req_id)
-            if pending is not None:
-                pending.discard(self._normalize_path(path))
-                if not pending:
-                    self._pending_lookup_paths.pop(req_id, None)
+            self._release_pending_shards_locked(req_id, (shard,))
             if not hit:
                 return False
-            if req_id in self._closed_requests or shard in self._evicting:
+            if (
+                req_id in self._closed_requests
+                or req_id in self._lookup_cancelled_requests
+                or shard in self._evicting
+            ):
                 return False
             self._request_shards.setdefault(req_id, set()).add(shard)
             self._last_used[shard] = time.time()
@@ -185,13 +208,23 @@ class ShardLeaseIndex:
     def open_request(self, req_id: str) -> None:
         with self._lock:
             self._closed_requests.pop(req_id, None)
+            self._lookup_cancelled_requests.discard(req_id)
             self._request_shards.setdefault(req_id, set())
-            self._pending_lookup_paths.pop(req_id, None)
+            self._pending_lookup_shards.pop(req_id, None)
+
+    def cancel_lookup(self, req_id: str, release_pins: bool = True) -> None:
+        """Fence late metadata results without closing the request for stores."""
+        with self._lock:
+            self._lookup_cancelled_requests.add(req_id)
+            self._pending_lookup_shards.pop(req_id, None)
+            if release_pins:
+                self._request_shards.pop(req_id, None)
 
     def release_request(self, req_id: str) -> None:
         with self._lock:
             self._request_shards.pop(req_id, None)
-            self._pending_lookup_paths.pop(req_id, None)
+            self._pending_lookup_shards.pop(req_id, None)
+            self._lookup_cancelled_requests.discard(req_id)
             self._closed_requests[req_id] = None
             self._closed_requests.move_to_end(req_id)
             if len(self._closed_requests) > 100_000:
@@ -235,8 +268,8 @@ class ShardLeaseIndex:
                 pinned.update(shards)
             for shards in self._job_shards.values():
                 pinned.update(shards)
-            for paths in self._pending_lookup_paths.values():
-                pinned.update(self.shard_for_path(path) for path in paths)
+            for shards in self._pending_lookup_shards.values():
+                pinned.update(shards)
             candidates = (
                 (last_used, shard)
                 for shard, last_used in self._last_used.items()

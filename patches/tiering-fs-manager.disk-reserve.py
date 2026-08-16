@@ -80,6 +80,7 @@ class FileSystemTierMetrics:
     REQUEST_TIMEOUT = "vllm:kv_offload_fs_request_timeouts"
     CIRCUIT_BYPASS = "vllm:kv_offload_fs_circuit_bypasses"
     QUEUE_DROPPED_KEYS = "vllm:kv_offload_fs_lookup_dropped_keys"
+    CANCELLED_KEYS = "vllm:kv_offload_fs_lookup_cancelled_keys"
     LOAD_FAILURE = "vllm:kv_offload_fs_load_failures"
     DEFERRED_REQUESTS = "vllm:kv_offload_fs_deferred_requests"
     OLDEST_DEFERRED = "vllm:kv_offload_fs_oldest_deferred_seconds"
@@ -100,12 +101,14 @@ class FsAsyncLookupManager(AsyncLookupManager):
         tier_type: str,
         max_pending_batches: int,
         max_keys_per_step: int,
+        max_keys_per_batch: int,
         n_lookup_threads: int,
     ) -> None:
         super().__init__(
             tier_type=tier_type,
             max_pending_batches=max_pending_batches,
             max_keys_per_step=max_keys_per_step,
+            max_keys_per_batch=max_keys_per_batch,
             num_workers=n_lookup_threads,
         )
         self._tier = tier
@@ -166,6 +169,10 @@ class FileSystemTierManager(SecondaryTierManager):
             FileSystemTierMetrics.QUEUE_DROPPED_KEYS: (
                 "Filesystem lookup keys dropped as misses to keep queues bounded."
             ),
+            FileSystemTierMetrics.CANCELLED_KEYS: (
+                "Unresolved filesystem lookup keys cancelled when no request "
+                "still needed them."
+            ),
             FileSystemTierMetrics.LOAD_FAILURE: (
                 "Filesystem KV load jobs that failed and invalidated cached hits."
             ),
@@ -222,6 +229,7 @@ class FileSystemTierManager(SecondaryTierManager):
         shard_touch_interval_seconds: float = 30,
         max_pending_lookup_batches: int = 8,
         max_lookup_keys_per_step: int = 16_384,
+        max_lookup_keys_per_batch: int = 256,
         n_lookup_threads: int = 4,
     ):
         """
@@ -254,6 +262,8 @@ class FileSystemTierManager(SecondaryTierManager):
                 waiting for the filesystem lookup thread. Saturation is a miss.
             max_lookup_keys_per_step: Maximum new metadata keys admitted in one
                 scheduler step. Excess keys are treated as misses.
+            max_lookup_keys_per_batch: Maximum paths in one worker operation.
+                Small chunks publish useful results promptly and bound stale work.
             n_lookup_threads: Number of concurrent request-local metadata probes.
         """
         super().__init__(offloading_spec, primary_kv_view, tier_type)
@@ -278,6 +288,7 @@ class FileSystemTierManager(SecondaryTierManager):
         if (
             max_pending_lookup_batches <= 0
             or max_lookup_keys_per_step <= 0
+            or max_lookup_keys_per_batch <= 0
             or n_lookup_threads <= 0
         ):
             raise ValueError("filesystem lookup queue limits must be positive")
@@ -379,6 +390,7 @@ class FileSystemTierManager(SecondaryTierManager):
             tier_type=self.tier_type,
             max_pending_batches=max_pending_lookup_batches,
             max_keys_per_step=max_lookup_keys_per_step,
+            max_keys_per_batch=max_lookup_keys_per_batch,
             n_lookup_threads=n_lookup_threads,
         )
 
@@ -389,11 +401,10 @@ class FileSystemTierManager(SecondaryTierManager):
 
     @override
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
-        path = self.file_mapper.get_file_name(key)
-        self._leases.begin_lookup(req_context.req_id, path)
         result = self._lookup_manager.lookup(key, req_context)
         if result is None:
             return LookupResult.RETRY
+        path = self.file_mapper.get_file_name(key)
         return (
             LookupResult.HIT
             if self._leases.resolve_cached_lookup(
@@ -401,6 +412,13 @@ class FileSystemTierManager(SecondaryTierManager):
             )
             else LookupResult.MISS
         )
+
+    def cancel_lookup(
+        self, req_context: ReqContext, release_pins: bool = True
+    ) -> None:
+        """Cancel optional metadata work while keeping the request store-capable."""
+        self._lookup_manager.cleanup(req_context.req_id)
+        self._leases.cancel_lookup(req_context.req_id, release_pins=release_pins)
 
     @override
     def touch(self, keys: Iterable[OffloadKey], req_context: ReqContext) -> None:
@@ -603,6 +621,11 @@ class FileSystemTierManager(SecondaryTierManager):
         if dropped:
             self._stats.increase_counter(
                 FileSystemTierMetrics.QUEUE_DROPPED_KEYS, dropped
+            )
+        cancelled = self._lookup_manager.take_cancelled_keys()
+        if cancelled:
+            self._stats.increase_counter(
+                FileSystemTierMetrics.CANCELLED_KEYS, cancelled
             )
         if self._load_failure_delta:
             self._stats.increase_counter(

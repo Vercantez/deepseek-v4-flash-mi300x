@@ -583,6 +583,23 @@ class OffloadingConnectorScheduler:
             time.monotonic() - start_time,
         )
 
+    def _cancel_external_lookup_work(
+        self, req_status: RequestOffloadState, release_pins: bool
+    ) -> None:
+        """Stop optional secondary-tier probes once their routing decision is made.
+
+        TieringOffloadingManager intentionally has no public cancellation API
+        in this pinned vLLM revision. Filesystem tiers may expose this narrow
+        hook; other secondary tiers continue to use their upstream lifecycle.
+        """
+        for tier in getattr(self.manager, "secondary_tiers", ()):
+            cancel_lookup = getattr(tier, "cancel_lookup", None)
+            if cancel_lookup is not None:
+                cancel_lookup(
+                    req_status.req_context,
+                    release_pins=release_pins,
+                )
+
     def _generate_job_id(self) -> int:
         job_id = self._job_counter
         self._job_counter += 1
@@ -962,6 +979,7 @@ class OffloadingConnectorScheduler:
         elif bypass_reason is not None:
             req_status.external_lookup_bypassed = True
             num_hit_tokens = 0
+            self._cancel_external_lookup_work(req_status, release_pins=True)
             logger.warning(
                 "Failing open external KV lookup for request %s (%s)",
                 request_id,
@@ -990,6 +1008,9 @@ class OffloadingConnectorScheduler:
                     waited = time.monotonic() - req_status.deferred_lookup_start_time
                     req_status.external_lookup_bypassed = True
                     num_hit_tokens = 0
+                    self._cancel_external_lookup_work(
+                        req_status, release_pins=True
+                    )
                     self._maybe_observe_lookup_async_delay(req_status)
                     logger.warning(
                         "External KV lookup for request %s exceeded its %.3fs "
@@ -1000,6 +1021,9 @@ class OffloadingConnectorScheduler:
                     )
             else:
                 self._lookup_fail_open.resolve(request_id)
+                self._cancel_external_lookup_work(
+                    req_status, release_pins=not bool(num_hit_tokens)
+                )
                 self._maybe_observe_lookup_async_delay(req_status)
         req_status.update_num_hit_chunks(num_computed_tokens + (num_hit_tokens or 0))
 

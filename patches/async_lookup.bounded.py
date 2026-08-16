@@ -25,9 +25,9 @@ There is no explicit lock.  Thread safety is achieved by ownership:
 
 lookup() accumulates new keys in _lookup_batch without touching the queue.
 flush() is called once per step from the tier's on_schedule_end(), splitting
-the accumulated work into request-local batches. A slow long-context probe can
-therefore consume only one worker instead of head-of-line blocking every other
-request behind tens of thousands of faccessat() calls.
+request work into small chunks and admitting those chunks round-robin. Multiple
+workers can therefore cooperate on a large cache hit, while a miss, timeout, or
+cancelled request leaves at most one small in-flight operation per worker.
 drain_results() is called before any lookup() calls in the same step, so
 lookup() is a pure OrderedDict operation.
 """
@@ -35,8 +35,10 @@ lookup() is a pure OrderedDict operation.
 import queue
 import threading
 from abc import ABC, abstractmethod
-from collections.abc import Iterable
+from collections import deque
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
+from itertools import islice
 
 from vllm.logger import init_logger
 from vllm.v1.kv_offload.base import OffloadKey, ReqContext
@@ -44,10 +46,18 @@ from vllm.v1.kv_offload.base import OffloadKey, ReqContext
 logger = init_logger(__name__)
 
 
+def _active_lookup_token() -> threading.Event:
+    token = threading.Event()
+    token.set()
+    return token
+
+
 @dataclass(slots=True)
 class LookupState:
     result: bool | None = None  # True (found), False (not found), None
     request_ids: set[str] = field(default_factory=set)  # requests asking for the lookup
+    # Workers retain only this cancellation token, never scheduler-owned maps.
+    active: threading.Event = field(default_factory=_active_lookup_token)
 
 
 class AsyncLookupManager(ABC):
@@ -74,17 +84,22 @@ class AsyncLookupManager(ABC):
         tier_type: str,
         max_pending_batches: int = 8,
         max_keys_per_step: int = 16_384,
+        max_keys_per_batch: int = 256,
         num_workers: int = 4,
     ) -> None:
         if max_pending_batches <= 0:
             raise ValueError("max_pending_batches must be positive")
         if max_keys_per_step <= 0:
             raise ValueError("max_keys_per_step must be positive")
+        if max_keys_per_batch <= 0:
+            raise ValueError("max_keys_per_batch must be positive")
         if num_workers <= 0:
             raise ValueError("num_workers must be positive")
         self._tier_type = tier_type
         self._max_keys_per_step = max_keys_per_step
+        self._max_keys_per_batch = max_keys_per_batch
         self._dropped_keys_delta = 0
+        self._cancelled_keys_delta = 0
 
         # key → LookupState; scheduler-owned, no lock needed.
         self._lookup_state: dict[OffloadKey, LookupState] = {}
@@ -93,12 +108,14 @@ class AsyncLookupManager(ABC):
 
         # Accumulates (key, req_context) pairs during lookup() calls.
         # Flushed as one queue item per step by flush().
-        self._lookup_batch: list[tuple[OffloadKey, ReqContext]] = []
+        self._lookup_batch: list[
+            tuple[OffloadKey, ReqContext, threading.Event]
+        ] = []
 
         # Scheduler → workers: one request-local batch per item.
         # None is used as a shutdown sentinel.
         self._lookup_queue: queue.Queue[
-            list[tuple[OffloadKey, ReqContext]] | None
+            list[tuple[OffloadKey, ReqContext, threading.Event]] | None
         ] = queue.Queue(maxsize=max_pending_batches)
 
         # Worker → scheduler: completed result batches.
@@ -108,6 +125,8 @@ class AsyncLookupManager(ABC):
             queue.SimpleQueue()
         )
         self._need_to_drain: bool = False
+        self._in_flight_batches = 0
+        self._in_flight_lock = threading.Lock()
 
         self._threads = [
             threading.Thread(
@@ -156,7 +175,7 @@ class AsyncLookupManager(ABC):
             state = LookupState()
             self._lookup_state[key] = state
             if len(self._lookup_batch) < self._max_keys_per_step:
-                self._lookup_batch.append((key, req_context))
+                self._lookup_batch.append((key, req_context, state.active))
             else:
                 # The filesystem cache is optional.  A saturated metadata
                 # path is a cache miss, never scheduler backpressure.
@@ -170,26 +189,39 @@ class AsyncLookupManager(ABC):
         """Post this step's accumulated keys to the worker thread.
 
         Called once per step from on_schedule_end() after all lookup() calls
-        are done. The worker receives the full batch and processes it during
-        the model-execution window, maximising time available before the next
-        step's drain_results(). Safe to call with an empty batch (no-op).
+        are done. Request work is split into small chunks and admitted in
+        round-robin order. This lets all workers cooperate on a long cached
+        prefix without allowing one request to monopolize the metadata queue.
+        Safe to call with an empty batch (no-op).
         """
         self._need_to_drain = True
         if self._lookup_batch:
             pending = self._lookup_batch
             self._lookup_batch = []
-            batches: dict[str, list[tuple[OffloadKey, ReqContext]]] = {}
-            for key, req_context in pending:
-                batches.setdefault(req_context.req_id, []).append((key, req_context))
-            for batch in batches.values():
+            batches: dict[
+                str, list[tuple[OffloadKey, ReqContext, threading.Event]]
+            ] = {}
+            for key, req_context, active in pending:
+                batches.setdefault(req_context.req_id, []).append(
+                    (key, req_context, active)
+                )
+            request_chunks: deque[
+                Iterator[tuple[OffloadKey, ReqContext, threading.Event]]
+            ] = deque(iter(batch) for batch in batches.values())
+            while request_chunks:
+                batch_iter = request_chunks.popleft()
+                batch = list(islice(batch_iter, self._max_keys_per_batch))
+                if not batch:
+                    continue
                 try:
                     self._lookup_queue.put_nowait(batch)
                 except queue.Full:
-                    for key, _ in batch:
+                    for key, _, active in batch:
                         state = self._lookup_state.get(key)
-                        if state is not None:
+                        if state is not None and active.is_set():
                             state.result = False
                     self._dropped_keys_delta += len(batch)
+                request_chunks.append(batch_iter)
 
     def drain_results(self) -> None:
         """Apply pending worker results to _lookup_state.
@@ -213,9 +245,14 @@ class AsyncLookupManager(ABC):
         index to visit only keys associated with this request.
         """
         for key in self._req_keys.pop(req_id, ()):
-            state = self._lookup_state[key]
+            state = self._lookup_state.get(key)
+            if state is None:
+                continue
             state.request_ids.discard(req_id)
             if not state.request_ids:
+                if state.result is None:
+                    self._cancelled_keys_delta += 1
+                state.active.clear()
                 del self._lookup_state[key]
 
     def invalidate(self, keys: Iterable[OffloadKey]) -> None:
@@ -230,9 +267,15 @@ class AsyncLookupManager(ABC):
         self._dropped_keys_delta = 0
         return dropped
 
+    def take_cancelled_keys(self) -> int:
+        cancelled = self._cancelled_keys_delta
+        self._cancelled_keys_delta = 0
+        return cancelled
+
     @property
     def pending_batches(self) -> int:
-        return self._lookup_queue.qsize()
+        with self._in_flight_lock:
+            return self._lookup_queue.qsize() + self._in_flight_batches
 
     @property
     def pending_keys(self) -> int:
@@ -259,23 +302,34 @@ class AsyncLookupManager(ABC):
 
             if not pending:
                 continue
-            req_context = pending[0][1]
-            keys = [key for key, _ in pending]
-            results: list[tuple[OffloadKey, bool]] = []
+            with self._in_flight_lock:
+                self._in_flight_batches += 1
             try:
-                hits = self.batch_lookup(keys, req_context)
-            except Exception as exc:
-                logger.warning(
-                    "batch_lookup failed on tier %s for %d keys: %s",
-                    self._tier_type,
-                    len(keys),
-                    exc,
-                )
-                hits = (False for _ in keys)
+                active_pending = [item for item in pending if item[2].is_set()]
+                if not active_pending:
+                    continue
+                req_context = active_pending[0][1]
+                keys = [key for key, _, _ in active_pending]
+                results: list[tuple[OffloadKey, bool]] = []
+                try:
+                    hits = self.batch_lookup(keys, req_context)
+                except Exception as exc:
+                    logger.warning(
+                        "batch_lookup failed on tier %s for %d keys: %s",
+                        self._tier_type,
+                        len(keys),
+                        exc,
+                    )
+                    hits = (False for _ in keys)
 
-            for key, hit in zip(keys, hits):
-                results.append((key, hit))
+                for (key, _, active), hit in zip(active_pending, hits):
+                    if active.is_set():
+                        results.append((key, hit))
 
-            # Post the entire batch as one item — no lock needed.
-            if results:
-                self._pending_results.put(results)
+                # Publish each small chunk independently. A large request no
+                # longer withholds early hits until every path has completed.
+                if results:
+                    self._pending_results.put(results)
+            finally:
+                with self._in_flight_lock:
+                    self._in_flight_batches -= 1

@@ -164,7 +164,7 @@ Most `patches/*.py` files are **full-file overlays** mounted read-only over thei
 | `dspark-speculator.independent-draft-gumbel.py` + `spec-decode-utils.independent-draft-gumbel.py` | `vllm/v1/worker/gpu/spec_decode/dspark/speculator.py` + `.../spec_decode/utils.py` | Draft-proposal Gumbel noise salted away from rejection/recovery noise | Required only with `draft_sample_method=probabilistic` (the recipe's greedy path does not need it) |
 | `kv_offload_cpu_gpu_worker.load-war.py` | `vllm/v1/kv_offload/cpu/gpu_worker.py` | Fence CPU→GPU KV restores behind in-flight compute ([#47282](https://github.com/vllm-project/vllm/issues/47282), [PR #47291](https://github.com/vllm-project/vllm/pull/47291)) | Required only with `--kv-offloading-backend native` |
 | `offloading-scheduler.dspark-prefix.py` + `kv_lookup_fail_open.py` | `vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py` + sibling module | Exclude DSpark's ephemeral draft group from external reuse and enforce a request deadline/circuit breaker around optional cache lookup and promotion | Required with DSpark + native/tiered KV offload; DSpark handling is based on [#47890](https://github.com/vllm-project/vllm/issues/47890) / [#47891](https://github.com/vllm-project/vllm/pull/47891) |
-| `async_lookup.bounded.py` + `tiering-fs-bounded-lru.py` + `tiering-fs-manager.disk-reserve.py` | `vllm/v1/kv_offload/tiering/async_lookup.py` + filesystem tier modules | Bound asynchronous metadata work, invalidate failed loads, lease active shards, retire only idle LRU shards, and reject stores before consuming the 2 TiB OS reserve | Required with the filesystem tier until upstream makes secondary storage fail-open and bounded |
+| `async_lookup.bounded.py` + `tiering-fs-bounded-lru.py` + `tiering-fs-manager.disk-reserve.py` | `vllm/v1/kv_offload/tiering/async_lookup.py` + filesystem tier modules | Probe request prefixes in parallel 256-key chunks, cancel obsolete work, track eviction leases per shard, invalidate failed loads, retire only idle LRU shards, and reject stores before consuming the 2 TiB OS reserve | Required with the filesystem tier until upstream makes secondary storage fast, fail-open, and cancellation-aware |
 | `apply-deepseek-v4-reasoning-effort.py` | Patches `vllm/tokenizers/deepseek_v4.py` + `deepseek_v4_encoding.py` at startup | Restore the model revision's native `low`/`high`/`max` prefixes and normalize OpenAI aliases (`minimal→low`, `medium→high`, `xhigh→max`) | Required with pinned vLLM `124154a88`; remove after upstream adopts the 0731 encoding revision |
 | `structural-tag-registry.deepseek-v4-auto.py` | `vllm/tool_parsers/structural_tag_registry.py` | Keep triggered DSML grammar enabled for `tool_choice=auto` + non-strict tools | Required for reliable OpenCode-style tool calls; based on [#40801](https://github.com/vllm-project/vllm/issues/40801) / [#46632](https://github.com/vllm-project/vllm/pull/46632) |
 | `parser-*.dsml-orphan.py` + `tool-parser-utils.dsml-orphan.py` | `vllm/parser/...` + `vllm/tool_parsers/utils.py` | Recover declared DSML invokes when the model omits the outer `tool_calls` wrapper | Required for long-context agent sessions; backported from [#49117](https://github.com/vllm-project/vllm/pull/49117) |
@@ -202,6 +202,21 @@ Key optimizations in the production configuration:
 | Fused SiLU, fast DeepSeek routing, batch-sensitive expert tiles | Native C1 decode 34.5 → 56.6 tok/s (+64%); routing kernel 42.6 → 11.9 µs/layer |
 | `BLOCK_H=64` sparse-prefill tile | Prefill reaches 7.9–8.5K tok/s; sparse-attention trace 317 → 142 ms per request |
 | Static K=5, probabilistic + block rejection, causal verify | Production latency/acceptance tradeoff |
+
+### Filesystem lookup latency
+
+Filesystem metadata probes are divided into 256-key chunks and distributed
+round-robin over four lookup workers. Results are published after each chunk,
+and a request deadline or completed lookup cancels queued work immediately.
+This avoids the previous behavior where one long request occupied one worker
+until its entire metadata batch finished, even after the request had failed
+open to local prefill.
+
+Eviction leases track the cache's 4,096 hash shards rather than every pending
+file path. That keeps eviction lock work proportional to shard count instead
+of prompt length. The production configuration admits at most 8,192 new keys
+per scheduler step; overflow is an ordinary cache miss, never scheduler
+backpressure.
 | 2,048-token budget + 2,048-token long-prefill cap | Larger prefill slices while retaining scheduler interleaving |
 | 26 GB GPU KV + 96 GiB CPU + filesystem tier | 2.51M GPU-KV tokens plus persistent prefix spill |
 
