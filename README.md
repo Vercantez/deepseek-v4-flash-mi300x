@@ -199,10 +199,12 @@ HF_CACHE=/home/hotaisle/.cache/huggingface \
   docker compose -f compose.tp1x2.yaml up -d
 ```
 
-The replicas publish only on loopback at ports 8000 and 8002. Put both in the
-host proxy's upstream pool. Keep `PYTHONHASHSEED`, model revision, block size,
-KV dtype, and offload configuration identical or they will not share cache
-keys. `compose.tp2.yaml` remains available as the rollback profile.
+The replicas publish only on loopback at ports 8000 and 8002. Give each one a
+distinct private origin path and let the service router apply session affinity;
+do not hide them behind round-robin balancing because their GPU and CPU caches
+remain private. Keep `PYTHONHASHSEED`, model revision, block size, KV dtype, and
+offload configuration identical or they will not share disk-cache keys.
+`compose.tp2.yaml` remains available as the rollback profile.
 
 Key optimizations in the production configuration:
 
