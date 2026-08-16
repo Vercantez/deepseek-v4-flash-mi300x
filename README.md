@@ -205,6 +205,9 @@ distinct private origin path and let the service router apply session affinity;
 do not hide them behind round-robin balancing because their GPU and CPU caches
 remain private. Keep `PYTHONHASHSEED`, model revision, block size, KV dtype, and
 offload configuration identical or they will not share disk-cache keys.
+The TP1x2 profile also disables startup deletion of stale CPU-KV mmap files:
+`/dev/shm` is shared, so one replica cannot safely distinguish its own stale
+file from the other replica's live cache during a rolling restart.
 `compose.tp2.yaml` remains available as the rollback profile.
 
 Key optimizations in the production configuration:
