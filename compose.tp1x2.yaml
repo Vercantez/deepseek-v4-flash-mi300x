@@ -7,7 +7,6 @@ services:
       service: inference
     container_name: deepseek-v4-flash-0731-mi300x-0
     environment:
-      HIP_VISIBLE_DEVICES: "0"
       ROCR_VISIBLE_DEVICES: "0"
     ports:
       - 127.0.0.1:8000:8000
@@ -18,7 +17,6 @@ services:
       service: inference
     container_name: deepseek-v4-flash-0731-mi300x-1
     environment:
-      HIP_VISIBLE_DEVICES: "1"
       ROCR_VISIBLE_DEVICES: "1"
     ports:
       - 127.0.0.1:8002:8000
