@@ -151,6 +151,22 @@ def main() -> None:
             tier._drain_evictions()
         assert os.path.exists(path_a), "leased hot shard was evicted"
         assert not os.path.exists(path_b), "idle cold shard was not evicted"
+
+        # Eviction is a hard write gate: existing entries remain readable, but
+        # new stores fail open until the free-space target is restored.
+        paused_key = "ccc-paused"
+        tier.submit_store(
+            JobMetadata(
+                job_id=4,
+                keys=[paused_key],
+                block_ids=np.array([0], dtype=np.int64),
+                is_promotion=False,
+                req_context=hot_ctx,
+            )
+        )
+        paused = list(tier.get_finished_jobs())
+        assert len(paused) == 1 and not paused[0].success, paused
+        assert not os.path.exists(mapper.get_file_name(paused_key))
         tier.on_request_finished(hot_ctx)
         tier.shutdown()
         print("exact-image filesystem manager store/load/eviction smoke: PASS")

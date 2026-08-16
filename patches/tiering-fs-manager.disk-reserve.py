@@ -82,6 +82,7 @@ class FileSystemTierMetrics:
     QUEUE_DROPPED_KEYS = "vllm:kv_offload_fs_lookup_dropped_keys"
     CANCELLED_KEYS = "vllm:kv_offload_fs_lookup_cancelled_keys"
     LOAD_FAILURE = "vllm:kv_offload_fs_load_failures"
+    STORE_EVICTION_BYPASS = "vllm:kv_offload_fs_store_eviction_bypasses"
     DEFERRED_REQUESTS = "vllm:kv_offload_fs_deferred_requests"
     OLDEST_DEFERRED = "vllm:kv_offload_fs_oldest_deferred_seconds"
     CIRCUIT_OPEN = "vllm:kv_offload_fs_circuit_open"
@@ -175,6 +176,9 @@ class FileSystemTierManager(SecondaryTierManager):
             ),
             FileSystemTierMetrics.LOAD_FAILURE: (
                 "Filesystem KV load jobs that failed and invalidated cached hits."
+            ),
+            FileSystemTierMetrics.STORE_EVICTION_BYPASS: (
+                "Filesystem KV store jobs skipped while eviction was active."
             ),
         }
         gauge_docs = {
@@ -307,6 +311,7 @@ class FileSystemTierManager(SecondaryTierManager):
         self._eviction_active = False
         self._last_no_evictable_log = 0.0
         self._load_failure_delta = 0
+        self._store_eviction_bypass_delta = 0
         self._stats = OffloadingConnectorStats()
         self.locality = Locality(locality) if locality is not None else None
 
@@ -516,6 +521,13 @@ class FileSystemTierManager(SecondaryTierManager):
     def submit_store(self, job_metadata: JobMetadata) -> None:
         self._drain_evictions()
         self._maybe_schedule_eviction()
+        # Never make foreground inference compete with simultaneous cache
+        # writes and shard deletion. Existing disk entries remain readable;
+        # stores resume automatically after eviction reaches its target.
+        if self._eviction_active:
+            self._store_eviction_bypass_delta += 1
+            self._failed_jobs.append(job_metadata.job_id)
+            return
         paths = [self.file_mapper.get_file_name(key) for key in job_metadata.keys]
         required_bytes = len(paths) * self._block_size
         if not self._has_store_space(required_bytes):
@@ -632,6 +644,12 @@ class FileSystemTierManager(SecondaryTierManager):
                 FileSystemTierMetrics.LOAD_FAILURE, self._load_failure_delta
             )
             self._load_failure_delta = 0
+        if self._store_eviction_bypass_delta:
+            self._stats.increase_counter(
+                FileSystemTierMetrics.STORE_EVICTION_BYPASS,
+                self._store_eviction_bypass_delta,
+            )
+            self._store_eviction_bypass_delta = 0
         self._stats.set_gauge(
             FileSystemTierMetrics.PENDING_BATCHES,
             self._lookup_manager.pending_batches,
