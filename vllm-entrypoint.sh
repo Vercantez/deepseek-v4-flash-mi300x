@@ -5,5 +5,6 @@ set -eu
 find /dev/shm -maxdepth 1 -type f -name 'vllm_offload_*.mmap' -delete
 
 python3 /opt/apply-deepseek-v4-reasoning-effort.py
+python3 /opt/apply-deepseek-v4-indexer-prefill-budget.py
 
 exec vllm serve "$@"
