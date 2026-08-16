@@ -26,6 +26,7 @@ class ShardLeaseIndex:
     """LRU metadata and leases shared by lookup, transfer, and eviction paths."""
 
     def __init__(self, run_root: str) -> None:
+        self._input_run_root = os.path.abspath(run_root)
         self.run_root = os.path.realpath(run_root)
         self._lock = threading.RLock()
         self._last_used: dict[str, float] = {}
@@ -56,16 +57,32 @@ class ShardLeaseIndex:
                 except FileNotFoundError:
                     pass
 
-    def shard_for_path(self, path: str) -> str:
-        path = os.path.realpath(path)
+    def _normalize_path(self, path: str) -> str:
+        # Paths come exclusively from FileMapper's content hashes. Resolving
+        # every block with realpath() performs filesystem I/O twice per key and
+        # made a 16K-key metadata batch take seconds on the production cache.
+        # Lexical normalization retains the containment check without touching
+        # the filesystem for every lookup.
+        normalized = os.path.abspath(path)
+        if os.path.commonpath((self._input_run_root, normalized)) == self._input_run_root:
+            normalized = os.path.join(
+                self.run_root,
+                os.path.relpath(normalized, self._input_run_root),
+            )
+        elif os.path.commonpath((self.run_root, normalized)) != self.run_root:
+            raise ValueError(f"KV path is outside the cache root: {path!r}")
+        return normalized
+
+    def _shard_for_normalized_path(self, path: str) -> str:
         relative = os.path.relpath(path, self.run_root)
         shard_name = relative.split(os.sep, 1)[0]
         if not _SHARD_NAME.fullmatch(shard_name):
             raise ValueError(f"KV path is outside a hash shard: {path!r}")
         shard = os.path.join(self.run_root, shard_name)
-        if os.path.commonpath((self.run_root, shard)) != self.run_root:
-            raise ValueError(f"KV shard escapes run root: {path!r}")
         return shard
+
+    def shard_for_path(self, path: str) -> str:
+        return self._shard_for_normalized_path(self._normalize_path(path))
 
     def lookup_and_pin(
         self,
@@ -77,11 +94,13 @@ class ShardLeaseIndex:
         with self._lock:
             if req_id in self._closed_requests:
                 return [False] * len(paths)
-            shards = [self.shard_for_path(path) for path in paths]
+            normalized_paths = [self._normalize_path(path) for path in paths]
+            shards = [
+                self._shard_for_normalized_path(path) for path in normalized_paths
+            ]
             eligible = [shard not in self._evicting for shard in shards]
-            real_paths = [os.path.realpath(path) for path in paths]
             pending = self._pending_lookup_paths.setdefault(req_id, set())
-            pending.update(real_paths)
+            pending.update(normalized_paths)
         candidate_paths = [path for path, ok in zip(paths, eligible) if ok]
         try:
             candidate_hits = iter(exists(candidate_paths))
@@ -90,7 +109,7 @@ class ShardLeaseIndex:
             with self._lock:
                 pending = self._pending_lookup_paths.get(req_id)
                 if pending is not None:
-                    pending.difference_update(real_paths)
+                    pending.difference_update(normalized_paths)
                     if not pending:
                         self._pending_lookup_paths.pop(req_id, None)
             raise
@@ -100,9 +119,9 @@ class ShardLeaseIndex:
             now = time.time()
             pinned = self._request_shards.setdefault(req_id, set())
             pending = self._pending_lookup_paths.get(req_id)
-            for real_path, shard, hit in zip(real_paths, shards, hits):
+            for normalized_path, shard, hit in zip(normalized_paths, shards, hits):
                 if pending is not None:
-                    pending.discard(real_path)
+                    pending.discard(normalized_path)
                 if not hit:
                     continue
                 pinned.add(shard)
@@ -118,7 +137,7 @@ class ShardLeaseIndex:
             if req_id in self._closed_requests:
                 return
             self._pending_lookup_paths.setdefault(req_id, set()).add(
-                os.path.realpath(path)
+                self._normalize_path(path)
             )
 
     def resolve_cached_lookup(self, req_id: str, path: str, hit: bool) -> bool:
@@ -127,7 +146,7 @@ class ShardLeaseIndex:
         with self._lock:
             pending = self._pending_lookup_paths.get(req_id)
             if pending is not None:
-                pending.discard(os.path.realpath(path))
+                pending.discard(self._normalize_path(path))
                 if not pending:
                     self._pending_lookup_paths.pop(req_id, None)
             if not hit:

@@ -104,6 +104,12 @@ class ShardLeaseIndexTests(unittest.TestCase):
             [False],
         )
 
+    def test_paths_outside_cache_root_are_rejected_without_resolution(self) -> None:
+        index = bounded_lru.ShardLeaseIndex(str(self.root))
+        outside = str(self.root.parent / "000" / "00_g0" / "block.bin")
+        with self.assertRaises(ValueError):
+            index.shard_for_path(outside)
+
     def test_queued_lookup_is_protected_until_miss_resolves(self) -> None:
         path_a = self.make_block("aaa")
         self.make_block("bbb")
