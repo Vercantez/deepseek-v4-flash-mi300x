@@ -81,6 +81,8 @@ services:
       - --enable-auto-tool-choice
       - --enable-prompt-tokens-details
       - --enable-per-request-metrics
+      - --scheduling-policy
+      - priority
       - --kv-cache-dtype
       - fp8
       - --block-size
