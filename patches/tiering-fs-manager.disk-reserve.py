@@ -100,11 +100,13 @@ class FsAsyncLookupManager(AsyncLookupManager):
         tier_type: str,
         max_pending_batches: int,
         max_keys_per_step: int,
+        n_lookup_threads: int,
     ) -> None:
         super().__init__(
             tier_type=tier_type,
             max_pending_batches=max_pending_batches,
             max_keys_per_step=max_keys_per_step,
+            num_workers=n_lookup_threads,
         )
         self._tier = tier
 
@@ -220,6 +222,7 @@ class FileSystemTierManager(SecondaryTierManager):
         shard_touch_interval_seconds: float = 30,
         max_pending_lookup_batches: int = 8,
         max_lookup_keys_per_step: int = 16_384,
+        n_lookup_threads: int = 4,
     ):
         """
         Args:
@@ -251,6 +254,7 @@ class FileSystemTierManager(SecondaryTierManager):
                 waiting for the filesystem lookup thread. Saturation is a miss.
             max_lookup_keys_per_step: Maximum new metadata keys admitted in one
                 scheduler step. Excess keys are treated as misses.
+            n_lookup_threads: Number of concurrent request-local metadata probes.
         """
         super().__init__(offloading_spec, primary_kv_view, tier_type)
         if min_free_gb < 0:
@@ -271,7 +275,11 @@ class FileSystemTierManager(SecondaryTierManager):
             )
         if shard_touch_interval_seconds < 0:
             raise ValueError("shard_touch_interval_seconds must be non-negative")
-        if max_pending_lookup_batches <= 0 or max_lookup_keys_per_step <= 0:
+        if (
+            max_pending_lookup_batches <= 0
+            or max_lookup_keys_per_step <= 0
+            or n_lookup_threads <= 0
+        ):
             raise ValueError("filesystem lookup queue limits must be positive")
         self._root_dir = root_dir
         self._min_free_bytes = int(min_free_gb * 1024**3)
@@ -371,6 +379,7 @@ class FileSystemTierManager(SecondaryTierManager):
             tier_type=self.tier_type,
             max_pending_batches=max_pending_lookup_batches,
             max_keys_per_step=max_lookup_keys_per_step,
+            n_lookup_threads=n_lookup_threads,
         )
 
     @override

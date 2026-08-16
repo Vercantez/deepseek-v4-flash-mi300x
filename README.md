@@ -74,18 +74,17 @@ The stack uses a digest-pinned official vLLM ROCm nightly with:
 
 One MI300X (`gfx942`, 304 CUs, ~192 GiB HBM), a working AMD kernel driver, recent Docker Compose, ~235 GiB RAM for the CPU KV tier, and ~500 GB disk (the model cache alone is ~156 GB).
 
-The TP2 override keeps reads from its existing CPU/filesystem KV cache enabled
-but disables new GPU-to-host cache stores. On this ROCm host, both observed TP2
-engine failures were simultaneous GPU memory-access faults while connector
-metadata contained store jobs and no load jobs; one was explicitly a write to
-a read-only host page. Read-only cache mode removes that engine-killing DMA
-direction while preserving filesystem cache fulfills. The single-GPU override
-continues normal cache reads and writes.
+Both the single-GPU and TP2 overrides read and write the CPU/filesystem KV
+cache. TP2 no longer exposes its roughly 103 GB file-backed offload mmap per
+rank to ROCm DMA. Loads copy mmap data into a bounded pinned staging allocation
+before CPU-to-GPU DMA; stores DMA into pinned staging before a CPU copy into the
+mmap. This extra host memcpy avoids the simultaneous GPU page faults previously
+seen when either rank accessed the giant mapping directly.
 
-Filesystem metadata lookup admits up to four concurrent requests into its
-asynchronous probe path. The 500 ms deadline, eight-batch queue, and circuit
-breaker remain fail-open, so multiple sequences in a scheduler batch can reuse
-disk KV without letting storage latency block inference. FileMapper-generated
+Filesystem metadata lookup uses four request-local workers. The 500 ms
+deadline, eight-request queue, and circuit breaker remain fail-open, so a long
+65,536-key probe cannot head-of-line block every other sequence in the scheduler
+batch. FileMapper-generated
 block paths are normalized lexically under the cache root instead of calling
 `realpath()` twice per key; on the production volume that removes roughly 3.6
 seconds of metadata overhead from a 16,384-key batch. Each scheduler step may

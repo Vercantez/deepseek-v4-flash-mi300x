@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import ctypes
 import functools
 import time
 from collections import deque
@@ -68,6 +69,9 @@ class Transfer:
     batch_src: torch.Tensor
     batch_dst: torch.Tensor
     batch_sizes: torch.Tensor
+    staging: torch.Tensor | None = None
+    host_copy_destinations: np.ndarray | None = None
+    host_copy_time: float = 0.0
 
 
 def compute_sub_block_ptrs(
@@ -163,6 +167,18 @@ def _new_descriptor_buffers(
     )
 
 
+def copy_host_pages(
+    sources: np.ndarray,
+    destinations: np.ndarray,
+    sizes: np.ndarray,
+) -> float:
+    """Copy discontiguous host pages and return elapsed wall time."""
+    copy_started = time.monotonic()
+    for source, destination, size in zip(sources, destinations, sizes):
+        ctypes.memmove(int(destination), int(source), int(size))
+    return time.monotonic() - copy_started
+
+
 class SingleDirectionOffloadingHandler:
     """
     Handles transfers for a single direction, either CPU->GPU or GPU->CPU.
@@ -179,6 +195,7 @@ class SingleDirectionOffloadingHandler:
         kv_cache_groups_data_refs: list[list[CanonicalKVCacheRef]],
         gpu_to_cpu: bool,
         mmap_region: SharedOffloadRegion | None = None,
+        stage_mmap_transfers: bool = False,
     ):
         """
         Initialize a SingleDirectionOffloadingHandler.
@@ -226,6 +243,7 @@ class SingleDirectionOffloadingHandler:
 
         # mmap_region to clean up on shutdown (gpu_to_cpu handler owns it)
         self._mmap_region = mmap_region
+        self._stage_mmap_transfers = stage_mmap_transfers
         # job_id -> event
         self._transfer_events: dict[int, torch.Event] = {}
         # queue of transfers (job_id, stream, event)
@@ -359,6 +377,37 @@ class SingleDirectionOffloadingHandler:
         assert dst_offset == num_dst_blocks
         assert op_idx == num_copy_ops
 
+        # ROCm has faulted when its DMA engines directly access the enormous
+        # file-backed SharedOffloadRegion used by TP workers. Keep that mmap
+        # CPU-only: copy through a bounded pinned allocation for each transfer.
+        # The extra host memcpy is cheaper than losing both engine ranks, and
+        # it applies symmetrically to cache loads and stores.
+        staging: torch.Tensor | None = None
+        host_copy_destinations: np.ndarray | None = None
+        host_copy_time = 0.0
+        if self._stage_mmap_transfers and num_copy_ops > 0:
+            staging = torch.empty(
+                num_transfer_bytes,
+                dtype=torch.uint8,
+                pin_memory=PIN_MEMORY,
+            )
+            staging_base = staging.data_ptr()
+            offsets = np.empty(num_copy_ops, dtype=np.uint64)
+            offset = 0
+            for idx, size in enumerate(all_sizes):
+                offsets[idx] = offset
+                offset += int(size)
+            assert offset == num_transfer_bytes
+            staging_ptrs = staging_base + offsets
+            if self.gpu_to_cpu:
+                host_copy_destinations = all_dst.copy()
+                all_dst[:] = staging_ptrs
+            else:
+                host_copy_time = copy_host_pages(
+                    all_src.copy(), staging_ptrs, all_sizes
+                )
+                all_src[:] = staging_ptrs
+
         stream = (
             self._stream_pool.pop() if self._stream_pool else current_platform.Stream()
         )
@@ -410,6 +459,9 @@ class SingleDirectionOffloadingHandler:
                 batch_src=batch_src,
                 batch_dst=batch_dst,
                 batch_sizes=batch_sizes,
+                staging=staging,
+                host_copy_destinations=host_copy_destinations,
+                host_copy_time=host_copy_time,
             )
         )
 
@@ -420,8 +472,10 @@ class SingleDirectionOffloadingHandler:
         results: list[TransferResult] = []
         while self._transfers and self._transfers[0].end_event.query():
             transfer = self._transfers.popleft()
+            transfer.host_copy_time += self._complete_host_copy(transfer)
             transfer_time = (
                 transfer.start_event.elapsed_time(transfer.end_event) * 1e-3
+                + transfer.host_copy_time
             )  # elapsed_time is in milliseconds
             result = TransferResult(
                 job_id=transfer.job_id,
@@ -450,6 +504,7 @@ class SingleDirectionOffloadingHandler:
         while self._transfers:
             transfer = self._transfers.popleft()
             transfer.end_event.synchronize()
+            self._complete_host_copy(transfer)
         self._transfer_events.clear()
         self._stream_pool.clear()
         self._event_pool.clear()
@@ -459,6 +514,23 @@ class SingleDirectionOffloadingHandler:
         if self._mmap_region is not None:
             self._mmap_region.cleanup()
             self._mmap_region = None
+
+    @staticmethod
+    def _complete_host_copy(transfer: Transfer) -> float:
+        if transfer.host_copy_destinations is None:
+            return 0.0
+        assert transfer.staging is not None
+        source = transfer.staging.data_ptr()
+        offset = 0
+        sources = np.empty(len(transfer.host_copy_destinations), dtype=np.uint64)
+        for idx, size in enumerate(transfer.batch_sizes.numpy()):
+            sources[idx] = source + offset
+            offset += int(size)
+        return copy_host_pages(
+            sources,
+            transfer.host_copy_destinations,
+            transfer.batch_sizes.numpy(),
+        )
 
 
 class CPUOffloadingWorker(OffloadingWorker):
@@ -478,8 +550,16 @@ class CPUOffloadingWorker(OffloadingWorker):
     ):
         pin_memory = PIN_MEMORY
         logger.info("Allocating %d CPU tensors...", len(kv_caches.tensors))
-        if mmap_region is not None and pin_memory:
+        stage_mmap_transfers = bool(
+            mmap_region is not None and current_platform.is_rocm()
+        )
+        if mmap_region is not None and pin_memory and not stage_mmap_transfers:
             pin_mmap_region(mmap_region)
+        if stage_mmap_transfers:
+            logger.info(
+                "Keeping SharedOffloadRegion CPU-only; ROCm KV transfers use "
+                "bounded pinned staging buffers."
+            )
 
         gpu_tensors: list[torch.Tensor] = []
         cpu_tensors: list[torch.Tensor] = []
@@ -518,6 +598,7 @@ class CPUOffloadingWorker(OffloadingWorker):
             kv_cache_groups_data_refs=kv_caches.group_data_refs,
             gpu_to_cpu=True,
             mmap_region=mmap_region,
+            stage_mmap_transfers=stage_mmap_transfers,
         )
 
         self._load_handler = SingleDirectionOffloadingHandler(
@@ -526,6 +607,7 @@ class CPUOffloadingWorker(OffloadingWorker):
             blocks_per_chunk=blocks_per_chunk,
             kv_cache_groups_data_refs=kv_caches.group_data_refs,
             gpu_to_cpu=False,
+            stage_mmap_transfers=stage_mmap_transfers,
         )
 
     def submit_store(

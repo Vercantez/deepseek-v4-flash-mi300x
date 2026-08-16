@@ -6,7 +6,7 @@ existence checks.
 
 Each secondary tier that wants non-blocking lookups composes its own
 AsyncLookupManager instance internally.  The manager maintains lookup
-state and uses a background thread to execute batch_lookup() calls.
+state and uses bounded background workers to execute batch_lookup() calls.
 
 Locking design
 --------------
@@ -16,7 +16,7 @@ There is no explicit lock.  Thread safety is achieved by ownership:
   thread.  lookup(), flush(), and cleanup() read and write them directly.
 
 * _lookup_queue is written by the scheduler (flush → put_nowait, one item
-  per step) and read by the background thread (get).  queue.Queue is
+  per request) and read by the background workers (get).  queue.Queue is
   thread-safe.
 
 * _pending_results is written by the background thread (put) and read by
@@ -24,9 +24,10 @@ There is no explicit lock.  Thread safety is achieved by ownership:
   thread-safe by design.
 
 lookup() accumulates new keys in _lookup_batch without touching the queue.
-flush() is called once per step from the tier's on_schedule_end(), posting
-the entire batch as a single queue item so the background thread sees one
-batch per step.
+flush() is called once per step from the tier's on_schedule_end(), splitting
+the accumulated work into request-local batches. A slow long-context probe can
+therefore consume only one worker instead of head-of-line blocking every other
+request behind tens of thousands of faccessat() calls.
 drain_results() is called before any lookup() calls in the same step, so
 lookup() is a pure OrderedDict operation.
 """
@@ -73,11 +74,14 @@ class AsyncLookupManager(ABC):
         tier_type: str,
         max_pending_batches: int = 8,
         max_keys_per_step: int = 16_384,
+        num_workers: int = 4,
     ) -> None:
         if max_pending_batches <= 0:
             raise ValueError("max_pending_batches must be positive")
         if max_keys_per_step <= 0:
             raise ValueError("max_keys_per_step must be positive")
+        if num_workers <= 0:
+            raise ValueError("num_workers must be positive")
         self._tier_type = tier_type
         self._max_keys_per_step = max_keys_per_step
         self._dropped_keys_delta = 0
@@ -91,7 +95,7 @@ class AsyncLookupManager(ABC):
         # Flushed as one queue item per step by flush().
         self._lookup_batch: list[tuple[OffloadKey, ReqContext]] = []
 
-        # Scheduler → worker: one full step's batch per item.
+        # Scheduler → workers: one request-local batch per item.
         # None is used as a shutdown sentinel.
         self._lookup_queue: queue.Queue[
             list[tuple[OffloadKey, ReqContext]] | None
@@ -105,12 +109,16 @@ class AsyncLookupManager(ABC):
         )
         self._need_to_drain: bool = False
 
-        self._thread = threading.Thread(
-            target=self._worker,
-            name=f"vllm_offloading_lookup_{tier_type}",
-            daemon=True,
-        )
-        self._thread.start()
+        self._threads = [
+            threading.Thread(
+                target=self._worker,
+                name=f"vllm_offloading_lookup_{tier_type}_{worker_idx}",
+                daemon=True,
+            )
+            for worker_idx in range(num_workers)
+        ]
+        for thread in self._threads:
+            thread.start()
 
     @abstractmethod
     def batch_lookup(
@@ -164,20 +172,24 @@ class AsyncLookupManager(ABC):
         Called once per step from on_schedule_end() after all lookup() calls
         are done. The worker receives the full batch and processes it during
         the model-execution window, maximising time available before the next
-        step's drain_results().  Safe to call with an empty batch (no-op).
+        step's drain_results(). Safe to call with an empty batch (no-op).
         """
         self._need_to_drain = True
         if self._lookup_batch:
-            batch = self._lookup_batch
+            pending = self._lookup_batch
             self._lookup_batch = []
-            try:
-                self._lookup_queue.put_nowait(batch)
-            except queue.Full:
-                for key, _ in batch:
-                    state = self._lookup_state.get(key)
-                    if state is not None:
-                        state.result = False
-                self._dropped_keys_delta += len(batch)
+            batches: dict[str, list[tuple[OffloadKey, ReqContext]]] = {}
+            for key, req_context in pending:
+                batches.setdefault(req_context.req_id, []).append((key, req_context))
+            for batch in batches.values():
+                try:
+                    self._lookup_queue.put_nowait(batch)
+                except queue.Full:
+                    for key, _ in batch:
+                        state = self._lookup_state.get(key)
+                        if state is not None:
+                            state.result = False
+                    self._dropped_keys_delta += len(batch)
 
     def drain_results(self) -> None:
         """Apply pending worker results to _lookup_state.
@@ -227,11 +239,13 @@ class AsyncLookupManager(ABC):
         return len(self._lookup_batch)
 
     def shutdown(self) -> None:
-        """Stop the worker thread."""
+        """Stop the lookup workers."""
         # Shutdown is allowed to wait for bounded queued metadata work. Runtime
         # scheduler calls never block on this queue.
-        self._lookup_queue.put(None)
-        self._thread.join()
+        for _ in self._threads:
+            self._lookup_queue.put(None)
+        for thread in self._threads:
+            thread.join()
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -243,32 +257,24 @@ class AsyncLookupManager(ABC):
             if pending is None:
                 break
 
-            # Group by req_id.
-            batches: dict[str, tuple[ReqContext, list[OffloadKey]]] = {}
-            for key, req_context in pending:
-                req_id = req_context.req_id
-                if req_id not in batches:
-                    batches[req_id] = (req_context, [])
-                batches[req_id][1].append(key)
-
-            if not batches:
+            if not pending:
                 continue
-
+            req_context = pending[0][1]
+            keys = [key for key, _ in pending]
             results: list[tuple[OffloadKey, bool]] = []
-            for req_context, keys in batches.values():
-                try:
-                    hits = self.batch_lookup(keys, req_context)
-                except Exception as exc:
-                    logger.warning(
-                        "batch_lookup failed on tier %s for %d keys: %s",
-                        self._tier_type,
-                        len(keys),
-                        exc,
-                    )
-                    hits = (False for _ in keys)
+            try:
+                hits = self.batch_lookup(keys, req_context)
+            except Exception as exc:
+                logger.warning(
+                    "batch_lookup failed on tier %s for %d keys: %s",
+                    self._tier_type,
+                    len(keys),
+                    exc,
+                )
+                hits = (False for _ in keys)
 
-                for key, hit in zip(keys, hits):
-                    results.append((key, hit))
+            for key, hit in zip(keys, hits):
+                results.append((key, hit))
 
             # Post the entire batch as one item — no lock needed.
             if results:

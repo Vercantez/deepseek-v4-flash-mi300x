@@ -57,7 +57,42 @@ class ControlledLookupManager(module.AsyncLookupManager):
         return [True] * len(keys)
 
 
+class ConcurrentLookupManager(module.AsyncLookupManager):
+    def __init__(self, **kwargs):
+        self.started_ids: set[str] = set()
+        self.started_lock = threading.Lock()
+        self.both_started = threading.Event()
+        self.release = threading.Event()
+        super().__init__(tier_type="test", **kwargs)
+
+    def batch_lookup(self, keys, req_context):
+        with self.started_lock:
+            self.started_ids.add(req_context.req_id)
+            if len(self.started_ids) == 2:
+                self.both_started.set()
+        self.release.wait(5)
+        return [True] * len(keys)
+
+
 class AsyncLookupBoundTests(unittest.TestCase):
+    def test_different_requests_probe_concurrently(self) -> None:
+        manager = ConcurrentLookupManager(
+            max_pending_batches=2,
+            max_keys_per_step=8,
+            num_workers=2,
+        )
+        try:
+            manager.lookup(b"first", ReqContext("request-a"))
+            manager.lookup(b"second", ReqContext("request-b"))
+            manager.flush()
+            self.assertTrue(
+                manager.both_started.wait(2),
+                "one request-local probe blocked the other",
+            )
+        finally:
+            manager.release.set()
+            manager.shutdown()
+
     def test_per_step_key_limit_fails_open_as_miss(self) -> None:
         manager = ControlledLookupManager(max_pending_batches=1, max_keys_per_step=1)
         context = ReqContext("request")

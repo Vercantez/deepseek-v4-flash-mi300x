@@ -9,7 +9,25 @@
  from collections.abc import Iterable
  from typing import TYPE_CHECKING, ClassVar
  
-@@ -54,6 +56,10 @@
+@@ -31,11 +33,17 @@
+ from typing_extensions import override
+ 
+ from vllm.logger import init_logger
++from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
++    OffloadingConnectorStats,
++)
+ from vllm.v1.kv_offload.base import (
+     Locality,
+     LookupResult,
+     Medium,
++    OffloadingCounterMetadata,
+     OffloadingEvent,
++    OffloadingGaugeMetadata,
++    OffloadingMetricMetadata,
+     OffloadKey,
+     ReqContext,
+ )
+@@ -54,6 +62,10 @@
      batch_store_block,
      probe_o_direct,
  )
@@ -20,7 +38,48 @@
  from vllm.v1.kv_offload.tiering.fs.thread_pool import DualQueueThreadPool
  
  if TYPE_CHECKING:
-@@ -77,10 +83,18 @@
+@@ -62,6 +74,23 @@
+ logger = init_logger(__name__)
+ 
+ 
++class FileSystemTierMetrics:
++    """Prometheus names for fail-open filesystem-cache health."""
++
++    REQUEST_TIMEOUT = "vllm:kv_offload_fs_request_timeouts"
++    CIRCUIT_BYPASS = "vllm:kv_offload_fs_circuit_bypasses"
++    QUEUE_DROPPED_KEYS = "vllm:kv_offload_fs_lookup_dropped_keys"
++    LOAD_FAILURE = "vllm:kv_offload_fs_load_failures"
++    DEFERRED_REQUESTS = "vllm:kv_offload_fs_deferred_requests"
++    OLDEST_DEFERRED = "vllm:kv_offload_fs_oldest_deferred_seconds"
++    CIRCUIT_OPEN = "vllm:kv_offload_fs_circuit_open"
++    PENDING_BATCHES = "vllm:kv_offload_fs_lookup_pending_batches"
++    PENDING_KEYS = "vllm:kv_offload_fs_lookup_pending_keys"
++    EVICTION_ACTIVE = "vllm:kv_offload_fs_eviction_active"
++    EVICTIONS_IN_FLIGHT = "vllm:kv_offload_fs_evictions_in_flight"
++    FREE_BYTES = "vllm:kv_offload_fs_free_bytes"
++
++
+ class FsAsyncLookupManager(AsyncLookupManager):
+     """Async lookup manager for FileSystemTierManager."""
+ 
+@@ -69,18 +98,34 @@
+         self,
+         tier: "FileSystemTierManager",
+         tier_type: str,
++        max_pending_batches: int,
++        max_keys_per_step: int,
++        n_lookup_threads: int,
+     ) -> None:
+-        super().__init__(tier_type=tier_type)
++        super().__init__(
++            tier_type=tier_type,
++            max_pending_batches=max_pending_batches,
++            max_keys_per_step=max_keys_per_step,
++            num_workers=n_lookup_threads,
++        )
+         self._tier = tier
+ 
+     def batch_lookup(
          self, keys: list[OffloadKey], req_context: ReqContext
      ) -> Iterable[bool]:
          paths = [self._tier.file_mapper.get_file_name(k) for k in keys]
@@ -43,7 +102,68 @@
  
  
  class FileSystemTierManager(SecondaryTierManager):
-@@ -116,6 +130,11 @@
+@@ -106,6 +151,60 @@
+ 
+     medium: ClassVar[Medium] = Medium.STORAGE
+ 
++    @classmethod
++    def build_metric_definitions(
++        cls, extra_config: dict[str, object]
++    ) -> dict[str, OffloadingMetricMetadata]:
++        counter_docs = {
++            FileSystemTierMetrics.REQUEST_TIMEOUT: (
++                "Requests that treated external KV as a miss after its deadline."
++            ),
++            FileSystemTierMetrics.CIRCUIT_BYPASS: (
++                "Requests that bypassed external KV while storage was unavailable "
++                "or another metadata probe was in flight."
++            ),
++            FileSystemTierMetrics.QUEUE_DROPPED_KEYS: (
++                "Filesystem lookup keys dropped as misses to keep queues bounded."
++            ),
++            FileSystemTierMetrics.LOAD_FAILURE: (
++                "Filesystem KV load jobs that failed and invalidated cached hits."
++            ),
++        }
++        gauge_docs = {
++            FileSystemTierMetrics.DEFERRED_REQUESTS: "Requests awaiting external KV.",
++            FileSystemTierMetrics.OLDEST_DEFERRED: (
++                "Age in seconds of the oldest external KV lookup wait."
++            ),
++            FileSystemTierMetrics.CIRCUIT_OPEN: (
++                "Whether external KV reads are temporarily bypassed."
++            ),
++            FileSystemTierMetrics.PENDING_BATCHES: (
++                "Filesystem metadata batches queued to the lookup worker."
++            ),
++            FileSystemTierMetrics.PENDING_KEYS: (
++                "Filesystem metadata keys accumulated for the current step."
++            ),
++            FileSystemTierMetrics.EVICTION_ACTIVE: (
++                "Whether filesystem KV eviction is restoring its disk reserve."
++            ),
++            FileSystemTierMetrics.EVICTIONS_IN_FLIGHT: (
++                "Filesystem KV shards currently being retired."
++            ),
++            FileSystemTierMetrics.FREE_BYTES: (
++                "Available bytes on the filesystem KV cache volume."
++            ),
++        }
++        return {
++            **{
++                name: OffloadingCounterMetadata(documentation=documentation)
++                for name, documentation in counter_docs.items()
++            },
++            **{
++                name: OffloadingGaugeMetadata(documentation=documentation)
++                for name, documentation in gauge_docs.items()
++            },
++        }
++
+     def __init__(
+         self,
+         offloading_spec: "OffloadingSpec",
+@@ -116,6 +215,14 @@
          n_write_threads: int = 16,
          enable_kv_events: bool = False,
          locality: str | None = None,
@@ -52,10 +172,13 @@
 +        eviction_trigger_free_gb: float = 0,
 +        eviction_target_free_gb: float = 0,
 +        shard_touch_interval_seconds: float = 30,
++        max_pending_lookup_batches: int = 8,
++        max_lookup_keys_per_step: int = 16_384,
++        n_lookup_threads: int = 4,
      ):
          """
          Args:
-@@ -131,8 +150,52 @@
+@@ -131,8 +238,65 @@
                  cache events are enabled globally (kv_events_config).
              locality: Whether this tier's storage is LOCAL or REMOTE relative
                  to the publishing vLLM instance.
@@ -71,6 +194,11 @@
 +                space is restored. Must be at least the trigger.
 +            shard_touch_interval_seconds: Minimum interval between persisting
 +                a shard's LRU timestamp to its directory mtime.
++            max_pending_lookup_batches: Maximum scheduler-step metadata batches
++                waiting for the filesystem lookup thread. Saturation is a miss.
++            max_lookup_keys_per_step: Maximum new metadata keys admitted in one
++                scheduler step. Excess keys are treated as misses.
++            n_lookup_threads: Number of concurrent request-local metadata probes.
          """
          super().__init__(offloading_spec, primary_kv_view, tier_type)
 +        if min_free_gb < 0:
@@ -91,6 +219,12 @@
 +            )
 +        if shard_touch_interval_seconds < 0:
 +            raise ValueError("shard_touch_interval_seconds must be non-negative")
++        if (
++            max_pending_lookup_batches <= 0
++            or max_lookup_keys_per_step <= 0
++            or n_lookup_threads <= 0
++        ):
++            raise ValueError("filesystem lookup queue limits must be positive")
 +        self._root_dir = root_dir
 +        self._min_free_bytes = int(min_free_gb * 1024**3)
 +        self._eviction_trigger_bytes = int(eviction_trigger_free_gb * 1024**3)
@@ -105,10 +239,12 @@
 +        self._store_job_reserved_bytes: dict[JobId, int] = {}
 +        self._eviction_active = False
 +        self._last_no_evictable_log = 0.0
++        self._load_failure_delta = 0
++        self._stats = OffloadingConnectorStats()
          self.locality = Locality(locality) if locality is not None else None
  
          self.events: list[OffloadingEvent] | None = None
-@@ -172,6 +235,25 @@
+@@ -172,6 +336,26 @@
                      self.file_mapper.get_run_config(), f, indent=2, sort_keys=True
                  )
  
@@ -130,11 +266,23 @@
 +                        self._eviction_worker.submit(entry.path)
 +        self._store_job_paths: dict[JobId, list[str]] = {}
 +        self._load_job_paths: dict[JobId, list[str]] = {}
++        self._load_job_keys: dict[JobId, list[OffloadKey]] = {}
 +
          # Prefer O_DIRECT to bypass the page cache, but fall back to buffered
          # I/O on filesystems that reject it (e.g. overlayfs, some NFS mounts)
          # rather than failing every block.
-@@ -194,49 +276,194 @@
+@@ -190,53 +374,215 @@
+             thread_name_prefix="vllm_kv_py_fs",
+         )
+ 
+-        self._lookup_manager = FsAsyncLookupManager(tier=self, tier_type=self.tier_type)
++        self._lookup_manager = FsAsyncLookupManager(
++            tier=self,
++            tier_type=self.tier_type,
++            max_pending_batches=max_pending_lookup_batches,
++            max_keys_per_step=max_lookup_keys_per_step,
++            n_lookup_threads=n_lookup_threads,
++        )
  
      @override
      def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
@@ -289,9 +437,12 @@
      def submit_load(self, job_metadata: JobMetadata) -> None:
 +        paths = [self.file_mapper.get_file_name(key) for key in job_metadata.keys]
 +        if not self._leases.pin_job(job_metadata.job_id, paths):
++            self._lookup_manager.invalidate(job_metadata.keys)
++            self._load_failure_delta += 1
 +            self._failed_jobs.append(job_metadata.job_id)
 +            return
 +        self._load_job_paths[job_metadata.job_id] = paths
++        self._load_job_keys[job_metadata.job_id] = list(job_metadata.keys)
          task = functools.partial(
              batch_load_block,
 -            [self.file_mapper.get_file_name(key) for key in job_metadata.keys],
@@ -307,6 +458,7 @@
 +            self._pool.enqueue_load(job_metadata.job_id, 1, [task])
 +        except Exception:
 +            self._load_job_paths.pop(job_metadata.job_id, None)
++            self._load_job_keys.pop(job_metadata.job_id, None)
 +            self._leases.release_job(job_metadata.job_id)
 +            raise
  
@@ -325,6 +477,7 @@
          for job_id, success in self._pool.get_finished():
 +            store_paths = self._store_job_paths.pop(job_id, None)
 +            load_paths = self._load_job_paths.pop(job_id, None)
++            load_keys = self._load_job_keys.pop(job_id, None)
 +            reserved_bytes = self._store_job_reserved_bytes.pop(job_id, 0)
 +            self._reserved_store_bytes -= reserved_bytes
 +            self._leases.release_job(job_id)
@@ -332,10 +485,57 @@
 +                self._leases.record_store(store_paths)
 +            if success and load_paths:
 +                self._leases.record_access(load_paths)
++            if not success and load_keys:
++                # A failed promotion must destroy the cached positive result.
++                # Otherwise every scheduler step can retry a file that is
++                # corrupt, missing, or already deleted by the I/O layer.
++                self._lookup_manager.invalidate(load_keys)
++                self._load_failure_delta += 1
              if self.events is not None:
                  keys = self._store_job_keys.pop(job_id, None)
                  if success and keys:
-@@ -262,12 +489,23 @@
+@@ -252,6 +598,40 @@
+         return results
+ 
+     @override
++    def get_stats(self) -> OffloadingConnectorStats | None:
++        dropped = self._lookup_manager.take_dropped_keys()
++        if dropped:
++            self._stats.increase_counter(
++                FileSystemTierMetrics.QUEUE_DROPPED_KEYS, dropped
++            )
++        if self._load_failure_delta:
++            self._stats.increase_counter(
++                FileSystemTierMetrics.LOAD_FAILURE, self._load_failure_delta
++            )
++            self._load_failure_delta = 0
++        self._stats.set_gauge(
++            FileSystemTierMetrics.PENDING_BATCHES,
++            self._lookup_manager.pending_batches,
++        )
++        self._stats.set_gauge(
++            FileSystemTierMetrics.PENDING_KEYS,
++            self._lookup_manager.pending_keys,
++        )
++        self._stats.set_gauge(
++            FileSystemTierMetrics.EVICTION_ACTIVE, int(self._eviction_active)
++        )
++        self._stats.set_gauge(
++            FileSystemTierMetrics.EVICTIONS_IN_FLIGHT,
++            self._leases.evictions_in_flight,
++        )
++        self._stats.set_gauge(
++            FileSystemTierMetrics.FREE_BYTES, self._get_available_bytes()
++        )
++        stats = self._stats
++        self._stats = OffloadingConnectorStats()
++        return stats
++
++    @override
+     def take_events(self) -> Iterable[OffloadingEvent]:
+         if self.events is not None:
+             yield from self.events
+@@ -262,12 +642,23 @@
          """Block until all in-flight transfers in the threadpool finish."""
          self._pool.wait_idle()
  
@@ -359,7 +559,7 @@
  
      @override
      def shutdown(self) -> None:
-@@ -279,3 +517,5 @@
+@@ -279,3 +670,5 @@
          """
          self._lookup_manager.shutdown()
          self._pool.shutdown(wait=True)

@@ -1,12 +1,9 @@
-# Incremental production diff: fail-open filesystem KV cache
-# Base: repository main before this availability hardening change.
-
 diff --git a/patches/async_lookup.bounded.py b/patches/async_lookup.bounded.py
 new file mode 100644
-index 0000000..f329bc7
+index 0000000..1e9627b
 --- /dev/null
 +++ b/patches/async_lookup.bounded.py
-@@ -0,0 +1,275 @@
+@@ -0,0 +1,281 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""
@@ -15,7 +12,7 @@ index 0000000..f329bc7
 +
 +Each secondary tier that wants non-blocking lookups composes its own
 +AsyncLookupManager instance internally.  The manager maintains lookup
-+state and uses a background thread to execute batch_lookup() calls.
++state and uses bounded background workers to execute batch_lookup() calls.
 +
 +Locking design
 +--------------
@@ -25,7 +22,7 @@ index 0000000..f329bc7
 +  thread.  lookup(), flush(), and cleanup() read and write them directly.
 +
 +* _lookup_queue is written by the scheduler (flush → put_nowait, one item
-+  per step) and read by the background thread (get).  queue.Queue is
++  per request) and read by the background workers (get).  queue.Queue is
 +  thread-safe.
 +
 +* _pending_results is written by the background thread (put) and read by
@@ -33,9 +30,10 @@ index 0000000..f329bc7
 +  thread-safe by design.
 +
 +lookup() accumulates new keys in _lookup_batch without touching the queue.
-+flush() is called once per step from the tier's on_schedule_end(), posting
-+the entire batch as a single queue item so the background thread sees one
-+batch per step.
++flush() is called once per step from the tier's on_schedule_end(), splitting
++the accumulated work into request-local batches. A slow long-context probe can
++therefore consume only one worker instead of head-of-line blocking every other
++request behind tens of thousands of faccessat() calls.
 +drain_results() is called before any lookup() calls in the same step, so
 +lookup() is a pure OrderedDict operation.
 +"""
@@ -82,11 +80,14 @@ index 0000000..f329bc7
 +        tier_type: str,
 +        max_pending_batches: int = 8,
 +        max_keys_per_step: int = 16_384,
++        num_workers: int = 4,
 +    ) -> None:
 +        if max_pending_batches <= 0:
 +            raise ValueError("max_pending_batches must be positive")
 +        if max_keys_per_step <= 0:
 +            raise ValueError("max_keys_per_step must be positive")
++        if num_workers <= 0:
++            raise ValueError("num_workers must be positive")
 +        self._tier_type = tier_type
 +        self._max_keys_per_step = max_keys_per_step
 +        self._dropped_keys_delta = 0
@@ -100,7 +101,7 @@ index 0000000..f329bc7
 +        # Flushed as one queue item per step by flush().
 +        self._lookup_batch: list[tuple[OffloadKey, ReqContext]] = []
 +
-+        # Scheduler → worker: one full step's batch per item.
++        # Scheduler → workers: one request-local batch per item.
 +        # None is used as a shutdown sentinel.
 +        self._lookup_queue: queue.Queue[
 +            list[tuple[OffloadKey, ReqContext]] | None
@@ -114,12 +115,16 @@ index 0000000..f329bc7
 +        )
 +        self._need_to_drain: bool = False
 +
-+        self._thread = threading.Thread(
-+            target=self._worker,
-+            name=f"vllm_offloading_lookup_{tier_type}",
-+            daemon=True,
-+        )
-+        self._thread.start()
++        self._threads = [
++            threading.Thread(
++                target=self._worker,
++                name=f"vllm_offloading_lookup_{tier_type}_{worker_idx}",
++                daemon=True,
++            )
++            for worker_idx in range(num_workers)
++        ]
++        for thread in self._threads:
++            thread.start()
 +
 +    @abstractmethod
 +    def batch_lookup(
@@ -173,20 +178,24 @@ index 0000000..f329bc7
 +        Called once per step from on_schedule_end() after all lookup() calls
 +        are done. The worker receives the full batch and processes it during
 +        the model-execution window, maximising time available before the next
-+        step's drain_results().  Safe to call with an empty batch (no-op).
++        step's drain_results(). Safe to call with an empty batch (no-op).
 +        """
 +        self._need_to_drain = True
 +        if self._lookup_batch:
-+            batch = self._lookup_batch
++            pending = self._lookup_batch
 +            self._lookup_batch = []
-+            try:
-+                self._lookup_queue.put_nowait(batch)
-+            except queue.Full:
-+                for key, _ in batch:
-+                    state = self._lookup_state.get(key)
-+                    if state is not None:
-+                        state.result = False
-+                self._dropped_keys_delta += len(batch)
++            batches: dict[str, list[tuple[OffloadKey, ReqContext]]] = {}
++            for key, req_context in pending:
++                batches.setdefault(req_context.req_id, []).append((key, req_context))
++            for batch in batches.values():
++                try:
++                    self._lookup_queue.put_nowait(batch)
++                except queue.Full:
++                    for key, _ in batch:
++                        state = self._lookup_state.get(key)
++                        if state is not None:
++                            state.result = False
++                    self._dropped_keys_delta += len(batch)
 +
 +    def drain_results(self) -> None:
 +        """Apply pending worker results to _lookup_state.
@@ -236,11 +245,13 @@ index 0000000..f329bc7
 +        return len(self._lookup_batch)
 +
 +    def shutdown(self) -> None:
-+        """Stop the worker thread."""
++        """Stop the lookup workers."""
 +        # Shutdown is allowed to wait for bounded queued metadata work. Runtime
 +        # scheduler calls never block on this queue.
-+        self._lookup_queue.put(None)
-+        self._thread.join()
++        for _ in self._threads:
++            self._lookup_queue.put(None)
++        for thread in self._threads:
++            thread.join()
 +
 +    # ------------------------------------------------------------------
 +    # Internal helpers
@@ -252,32 +263,24 @@ index 0000000..f329bc7
 +            if pending is None:
 +                break
 +
-+            # Group by req_id.
-+            batches: dict[str, tuple[ReqContext, list[OffloadKey]]] = {}
-+            for key, req_context in pending:
-+                req_id = req_context.req_id
-+                if req_id not in batches:
-+                    batches[req_id] = (req_context, [])
-+                batches[req_id][1].append(key)
-+
-+            if not batches:
++            if not pending:
 +                continue
-+
++            req_context = pending[0][1]
++            keys = [key for key, _ in pending]
 +            results: list[tuple[OffloadKey, bool]] = []
-+            for req_context, keys in batches.values():
-+                try:
-+                    hits = self.batch_lookup(keys, req_context)
-+                except Exception as exc:
-+                    logger.warning(
-+                        "batch_lookup failed on tier %s for %d keys: %s",
-+                        self._tier_type,
-+                        len(keys),
-+                        exc,
-+                    )
-+                    hits = (False for _ in keys)
++            try:
++                hits = self.batch_lookup(keys, req_context)
++            except Exception as exc:
++                logger.warning(
++                    "batch_lookup failed on tier %s for %d keys: %s",
++                    self._tier_type,
++                    len(keys),
++                    exc,
++                )
++                hits = (False for _ in keys)
 +
-+                for key, hit in zip(keys, hits):
-+                    results.append((key, hit))
++            for key, hit in zip(keys, hits):
++                results.append((key, hit))
 +
 +            # Post the entire batch as one item — no lock needed.
 +            if results:
@@ -488,10 +491,10 @@ index 0eebb5f..49c6bad 100644
 +                request_id, time.monotonic()
 +            )
 +        if request.skip_reading_prefix_cache or req_status.external_lookup_bypassed:
-             num_hit_tokens = 0
++            num_hit_tokens = 0
 +        elif bypass_reason is not None:
 +            req_status.external_lookup_bypassed = True
-+            num_hit_tokens = 0
+             num_hit_tokens = 0
 +            logger.warning(
 +                "Failing open external KV lookup for request %s (%s)",
 +                request_id,
@@ -583,7 +586,7 @@ index 0eebb5f..49c6bad 100644
          if req_status is None:
              # Untracked request (offloading never started): no in-flight jobs,
 diff --git a/patches/tiering-fs-manager.disk-reserve.py b/patches/tiering-fs-manager.disk-reserve.py
-index 94c4663..0ddf8cf 100644
+index 94c4663..b60c8d7 100644
 --- a/patches/tiering-fs-manager.disk-reserve.py
 +++ b/patches/tiering-fs-manager.disk-reserve.py
 @@ -33,11 +33,17 @@ except ImportError:
@@ -628,23 +631,25 @@ index 94c4663..0ddf8cf 100644
  class FsAsyncLookupManager(AsyncLookupManager):
      """Async lookup manager for FileSystemTierManager."""
  
-@@ -75,8 +98,14 @@ class FsAsyncLookupManager(AsyncLookupManager):
+@@ -75,8 +98,16 @@ class FsAsyncLookupManager(AsyncLookupManager):
          self,
          tier: "FileSystemTierManager",
          tier_type: str,
 +        max_pending_batches: int,
 +        max_keys_per_step: int,
++        n_lookup_threads: int,
      ) -> None:
 -        super().__init__(tier_type=tier_type)
 +        super().__init__(
 +            tier_type=tier_type,
 +            max_pending_batches=max_pending_batches,
 +            max_keys_per_step=max_keys_per_step,
++            num_workers=n_lookup_threads,
 +        )
          self._tier = tier
  
      def batch_lookup(
-@@ -120,6 +149,60 @@ class FileSystemTierManager(SecondaryTierManager):
+@@ -120,6 +151,60 @@ class FileSystemTierManager(SecondaryTierManager):
  
      medium: ClassVar[Medium] = Medium.STORAGE
  
@@ -705,16 +710,17 @@ index 94c4663..0ddf8cf 100644
      def __init__(
          self,
          offloading_spec: "OffloadingSpec",
-@@ -135,6 +218,8 @@ class FileSystemTierManager(SecondaryTierManager):
+@@ -135,6 +220,9 @@ class FileSystemTierManager(SecondaryTierManager):
          eviction_trigger_free_gb: float = 0,
          eviction_target_free_gb: float = 0,
          shard_touch_interval_seconds: float = 30,
 +        max_pending_lookup_batches: int = 8,
 +        max_lookup_keys_per_step: int = 16_384,
++        n_lookup_threads: int = 4,
      ):
          """
          Args:
-@@ -162,6 +247,10 @@ class FileSystemTierManager(SecondaryTierManager):
+@@ -162,6 +250,11 @@ class FileSystemTierManager(SecondaryTierManager):
                  space is restored. Must be at least the trigger.
              shard_touch_interval_seconds: Minimum interval between persisting
                  a shard's LRU timestamp to its directory mtime.
@@ -722,19 +728,24 @@ index 94c4663..0ddf8cf 100644
 +                waiting for the filesystem lookup thread. Saturation is a miss.
 +            max_lookup_keys_per_step: Maximum new metadata keys admitted in one
 +                scheduler step. Excess keys are treated as misses.
++            n_lookup_threads: Number of concurrent request-local metadata probes.
          """
          super().__init__(offloading_spec, primary_kv_view, tier_type)
          if min_free_gb < 0:
-@@ -182,6 +271,8 @@ class FileSystemTierManager(SecondaryTierManager):
+@@ -182,6 +275,12 @@ class FileSystemTierManager(SecondaryTierManager):
              )
          if shard_touch_interval_seconds < 0:
              raise ValueError("shard_touch_interval_seconds must be non-negative")
-+        if max_pending_lookup_batches <= 0 or max_lookup_keys_per_step <= 0:
++        if (
++            max_pending_lookup_batches <= 0
++            or max_lookup_keys_per_step <= 0
++            or n_lookup_threads <= 0
++        ):
 +            raise ValueError("filesystem lookup queue limits must be positive")
          self._root_dir = root_dir
          self._min_free_bytes = int(min_free_gb * 1024**3)
          self._eviction_trigger_bytes = int(eviction_trigger_free_gb * 1024**3)
-@@ -196,6 +287,8 @@ class FileSystemTierManager(SecondaryTierManager):
+@@ -196,6 +295,8 @@ class FileSystemTierManager(SecondaryTierManager):
          self._store_job_reserved_bytes: dict[JobId, int] = {}
          self._eviction_active = False
          self._last_no_evictable_log = 0.0
@@ -743,7 +754,7 @@ index 94c4663..0ddf8cf 100644
          self.locality = Locality(locality) if locality is not None else None
  
          self.events: list[OffloadingEvent] | None = None
-@@ -253,6 +346,7 @@ class FileSystemTierManager(SecondaryTierManager):
+@@ -253,6 +354,7 @@ class FileSystemTierManager(SecondaryTierManager):
                          self._eviction_worker.submit(entry.path)
          self._store_job_paths: dict[JobId, list[str]] = {}
          self._load_job_paths: dict[JobId, list[str]] = {}
@@ -751,7 +762,7 @@ index 94c4663..0ddf8cf 100644
  
          # Prefer O_DIRECT to bypass the page cache, but fall back to buffered
          # I/O on filesystems that reject it (e.g. overlayfs, some NFS mounts)
-@@ -272,7 +366,12 @@ class FileSystemTierManager(SecondaryTierManager):
+@@ -272,7 +374,13 @@ class FileSystemTierManager(SecondaryTierManager):
              thread_name_prefix="vllm_kv_py_fs",
          )
  
@@ -761,11 +772,12 @@ index 94c4663..0ddf8cf 100644
 +            tier_type=self.tier_type,
 +            max_pending_batches=max_pending_lookup_batches,
 +            max_keys_per_step=max_lookup_keys_per_step,
++            n_lookup_threads=n_lookup_threads,
 +        )
  
      @override
      def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
-@@ -424,9 +523,12 @@ class FileSystemTierManager(SecondaryTierManager):
+@@ -424,9 +532,12 @@ class FileSystemTierManager(SecondaryTierManager):
      def submit_load(self, job_metadata: JobMetadata) -> None:
          paths = [self.file_mapper.get_file_name(key) for key in job_metadata.keys]
          if not self._leases.pin_job(job_metadata.job_id, paths):
@@ -778,7 +790,7 @@ index 94c4663..0ddf8cf 100644
          task = functools.partial(
              batch_load_block,
              paths,
-@@ -440,6 +542,7 @@ class FileSystemTierManager(SecondaryTierManager):
+@@ -440,6 +551,7 @@ class FileSystemTierManager(SecondaryTierManager):
              self._pool.enqueue_load(job_metadata.job_id, 1, [task])
          except Exception:
              self._load_job_paths.pop(job_metadata.job_id, None)
@@ -786,7 +798,7 @@ index 94c4663..0ddf8cf 100644
              self._leases.release_job(job_metadata.job_id)
              raise
  
-@@ -457,6 +560,7 @@ class FileSystemTierManager(SecondaryTierManager):
+@@ -457,6 +569,7 @@ class FileSystemTierManager(SecondaryTierManager):
          for job_id, success in self._pool.get_finished():
              store_paths = self._store_job_paths.pop(job_id, None)
              load_paths = self._load_job_paths.pop(job_id, None)
@@ -794,7 +806,7 @@ index 94c4663..0ddf8cf 100644
              reserved_bytes = self._store_job_reserved_bytes.pop(job_id, 0)
              self._reserved_store_bytes -= reserved_bytes
              self._leases.release_job(job_id)
-@@ -464,6 +568,12 @@ class FileSystemTierManager(SecondaryTierManager):
+@@ -464,6 +577,12 @@ class FileSystemTierManager(SecondaryTierManager):
                  self._leases.record_store(store_paths)
              if success and load_paths:
                  self._leases.record_access(load_paths)
@@ -807,7 +819,7 @@ index 94c4663..0ddf8cf 100644
              if self.events is not None:
                  keys = self._store_job_keys.pop(job_id, None)
                  if success and keys:
-@@ -478,6 +588,40 @@ class FileSystemTierManager(SecondaryTierManager):
+@@ -478,6 +597,40 @@ class FileSystemTierManager(SecondaryTierManager):
              results.append(JobResult(job_id=job_id, success=success))
          return results
  
