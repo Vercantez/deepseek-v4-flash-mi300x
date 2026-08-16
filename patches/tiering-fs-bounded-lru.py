@@ -28,6 +28,8 @@ class ShardLeaseIndex:
     def __init__(self, run_root: str) -> None:
         self._input_run_root = os.path.abspath(run_root)
         self.run_root = os.path.realpath(run_root)
+        self._input_root_prefix = self._input_run_root.rstrip(os.sep) + os.sep
+        self._root_prefix = self.run_root.rstrip(os.sep) + os.sep
         self._lock = threading.RLock()
         self._last_used: dict[str, float] = {}
         self._request_shards: dict[str, set[str]] = {}
@@ -63,18 +65,22 @@ class ShardLeaseIndex:
         # made a 16K-key metadata batch take seconds on the production cache.
         # Lexical normalization retains the containment check without touching
         # the filesystem for every lookup.
+        if path.startswith(self._root_prefix):
+            return path
+        if path.startswith(self._input_root_prefix):
+            return self._root_prefix + path[len(self._input_root_prefix) :]
         normalized = os.path.abspath(path)
-        if os.path.commonpath((self._input_run_root, normalized)) == self._input_run_root:
-            normalized = os.path.join(
-                self.run_root,
-                os.path.relpath(normalized, self._input_run_root),
-            )
-        elif os.path.commonpath((self.run_root, normalized)) != self.run_root:
+        if normalized.startswith(self._root_prefix):
+            return normalized
+        if normalized.startswith(self._input_root_prefix):
+            return self._root_prefix + normalized[len(self._input_root_prefix) :]
+        else:
             raise ValueError(f"KV path is outside the cache root: {path!r}")
-        return normalized
 
     def _shard_for_normalized_path(self, path: str) -> str:
-        relative = os.path.relpath(path, self.run_root)
+        if not path.startswith(self._root_prefix):
+            raise ValueError(f"KV path is outside the cache root: {path!r}")
+        relative = path[len(self._root_prefix) :]
         shard_name = relative.split(os.sep, 1)[0]
         if not _SHARD_NAME.fullmatch(shard_name):
             raise ValueError(f"KV path is outside a hash shard: {path!r}")

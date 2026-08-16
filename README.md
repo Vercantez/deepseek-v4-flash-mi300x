@@ -83,12 +83,13 @@ direction while preserving filesystem cache fulfills. The single-GPU override
 continues normal cache reads and writes.
 
 Filesystem metadata lookup admits up to four concurrent requests into its
-asynchronous probe path. The 100 ms deadline, eight-batch queue, and circuit
+asynchronous probe path. The 500 ms deadline, eight-batch queue, and circuit
 breaker remain fail-open, so multiple sequences in a scheduler batch can reuse
 disk KV without letting storage latency block inference. FileMapper-generated
 block paths are normalized lexically under the cache root instead of calling
 `realpath()` twice per key; on the production volume that removes roughly 3.6
-seconds of metadata overhead from a 16,384-key batch.
+seconds of metadata overhead from a 16,384-key batch. Each scheduler step may
+submit at most 65,536 keys; overflow is still treated as a cache miss.
 
 ### 2. Pull the pinned runtime and model
 
