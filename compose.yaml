@@ -35,13 +35,10 @@ services:
       - ./patches/fused_compress_quant_cache.fnuz-shuffle.py:/usr/local/lib/python3.12/dist-packages/vllm/models/deepseek_v4/common/ops/fused_compress_quant_cache.py:ro
       - ./patches/aiter_pa_mqa_logits.i64.py:/usr/local/lib/python3.12/dist-packages/aiter/ops/triton/gluon/pa_mqa_logits.py:ro
       - ./patches/rocm_aiter_mla_sparse.prefill-bh64.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py:ro
-      # vLLM 77469c9: keep speculative verify attention causal on ROCm small-head MLA.
-      - ./patches/rocm_aiter_mla.dspark-causal.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/rocm_aiter_mla.py:ro
-      - ./patches/dspark-speculator.independent-draft-gumbel.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py:ro
-      - ./patches/spec-decode-utils.independent-draft-gumbel.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/spec_decode/utils.py:ro
       # Fence native CPU KV transfers behind in-flight compute (vLLM #47282 / PR #47291).
       - ./patches/kv_offload_cpu_gpu_worker.load-war.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/kv_offload/cpu/gpu_worker.py:ro
-      # Keep reusable target-model KV hits when DSpark's ephemeral draft group misses (vLLM #47890 / PR #47891).
+      # Bound external KV lookup/promotion; the overlay also preserves the
+      # historical DSpark exclusion for explicit non-production experiments.
       - ./patches/offloading-scheduler.dspark-prefix.py:/usr/local/lib/python3.12/dist-packages/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py:ro
       # External storage is an optimization: bound metadata work and fail open
       # to local prefill before a slow/corrupt cache can stall inference.
@@ -107,10 +104,6 @@ services:
       - triton
       - --linear-backend
       - auto
-      - --speculative-config.method=dspark
-      - --speculative-config.num-speculative-tokens=5
-      - --speculative-config.draft-sample-method=probabilistic
-      - --speculative-config.rejection-sample-method=block
     healthcheck:
       test: [CMD, curl, -fsS, http://127.0.0.1:8000/health]
       interval: 30s

@@ -6,7 +6,7 @@ Results from the pinned stack (vLLM ROCm nightly `0.26.1rc1.dev229+g124154a88.ro
 
 | Metric | Result |
 | --- | ---: |
-| Single-stream decode (median per-stream, DSpark-7) | **168.6 tok/s** |
+| Historical single-stream decode (median per-stream, DSpark-7) | **168.6 tok/s** |
 | Prefill with tuned kernels | **≈ 7.9–8.5K tok/s** (6,988–7,019 tok/s on fresh prompts in the shipping profile) |
 | 8 concurrent streams | 542 tok/s aggregate, 90.3 tok/s median per stream |
 | 64-stream burst | 830 tok/s aggregate, no OOM, no engine errors |
@@ -34,7 +34,7 @@ MI300X (CDNA3) implements the AMD/Graphcore `fnuz` variant of E4M3, while MI325X
 This repository adds:
 
 1. **Correctness overlays** for the pinned ROCm nightly, including fixes not yet in upstream vLLM.
-2. **A validated serving configuration** with probabilistic DSpark drafting, block rejection, and static K=5. It uses a 2,048-token scheduler budget and a 2,048-token long-prefill cap.
+2. **A validated serving configuration** using native decoding, a 2,048-token scheduler budget, and a 2,048-token long-prefill cap. DSpark is disabled in production to reduce correctness risk and scheduler overhead under concurrency.
 3. **AITER GEMM tuning tables** for the recurring `gfx942` shapes the packaged tables were missing, plus a `gfx942` OGS geometry override for the MXFP4 experts.
 4. **A bounded hybrid KV strategy**: 26 GB of `fp8_ds_mla` GPU cache + 96 GiB native CPU offload + a persistent filesystem tier, with load-path and DSpark prefix fixes carried as overlays. Filesystem eviction is owned by vLLM: active requests and transfers lease their hash shards, the tier retires only idle LRU shards, and a 2 TiB hard reserve keeps inference alive if deletion cannot keep up. External lookups are strictly optional: after a 100 ms minimum budget, the next scheduler opportunity accepts an already-completed lookup or turns a still-pending lookup into a local-prefill cache miss. Only one request may probe filesystem metadata at a time; concurrent requests compute locally. A short circuit breaker prevents unhealthy storage from becoming repeated inference backpressure.
 
@@ -62,7 +62,7 @@ The stack uses a digest-pinned official vLLM ROCm nightly with:
 - `--trust-remote-code` and the DeepSeek V4 tokenizer, reasoning, and tool parsers
 - `fp8_ds_mla` KV cache (UE8M0 block-scaled FP8, not generic unscaled FP8) with 256-token blocks
 - `VLLM_ROCM_USE_AITER=1` and `--moe-backend triton`; Triton OGS handles the grouped MXFP4 experts, while AITER handles attention and dense linear layers
-- DSpark-5 speculative decoding with probabilistic drafting and block rejection
+- native, non-speculative decoding for the production worker
 - constrained DeepSeek V4 DSML generation plus recovery for missing outer tool-call wrappers
 - persistent filesystem KV offload behind the native 96 GiB CPU tier
 - full/breakable CUDA graph capture, giving one graph launch per token during steady decode
@@ -122,13 +122,13 @@ docker compose up -d
 docker compose logs -f inference
 ```
 
-A healthy start takes ~5 minutes and must show all of:
+A healthy start takes ~5 minutes and must show model loading, GPU KV sizing,
+graph capture, and application startup. It must not load the DSpark draft model:
 
 ```text
 Model loading took 156.67 GiB
-DSpark draft model loaded: 96 params
-GPU KV cache size: 1,927,444 tokens
-Maximum concurrency for 262,144 tokens per request: 7.35x
+GPU KV cache size: ... tokens
+Maximum concurrency for 262,144 tokens per request: ...x
 Created mmap file /dev/shm/vllm_offload_...mmap (103.08 GB)
 Capturing CUDA graphs (FULL)
 Application startup complete
@@ -160,10 +160,10 @@ Most `patches/*.py` files are **full-file overlays** mounted read-only over thei
 | `fused_compress_quant_cache.fnuz-shuffle.py` | `vllm/models/deepseek_v4/common/ops/fused_compress_quant_cache.py` | **FNUZ FP8 + 16×16 preshuffle** in the Lightning Indexer cache writer | **Required on MI300X**; MI325X/MI355X use OCP FP8 and must keep the stock bytes |
 | `aiter_pa_mqa_logits.i64.py` | `aiter/ops/triton/gluon/pa_mqa_logits.py` | 64-bit offsets in the `ChunkK=256` paged-MQA kernels | Required when KV offsets can exceed 4 GiB; skip for small KV pools |
 | `rocm_aiter_mla_sparse.prefill-bh64.py` | `vllm/v1/attention/ops/rocm_aiter_mla_sparse.py` | Deterministic `torch.topk` prefill + `BLOCK_H=64` head-512 sparse prefill | Determinism is required for reproducible tool calls; `BLOCK_H=64` is performance |
-| `rocm_aiter_mla.dspark-causal.py` | `vllm/v1/attention/backends/mla/rocm_aiter_mla.py` | Causal multi-token speculative verification | Required for DSpark on ROCm small-head MLA — now [upstream](https://github.com/vllm-project/vllm/commit/77469c9057bec3212a64877dbbf3b9c48c22d786); the overlay is the upstream file verbatim |
-| `dspark-speculator.independent-draft-gumbel.py` + `spec-decode-utils.independent-draft-gumbel.py` | `vllm/v1/worker/gpu/spec_decode/dspark/speculator.py` + `.../spec_decode/utils.py` | Draft-proposal Gumbel noise salted away from rejection/recovery noise | Required only with `draft_sample_method=probabilistic` (the recipe's greedy path does not need it) |
+| `rocm_aiter_mla.dspark-causal.py` | `vllm/v1/attention/backends/mla/rocm_aiter_mla.py` | Causal multi-token speculative verification | Experiment-only; not mounted by the production profiles |
+| `dspark-speculator.independent-draft-gumbel.py` + `spec-decode-utils.independent-draft-gumbel.py` | `vllm/v1/worker/gpu/spec_decode/dspark/speculator.py` + `.../spec_decode/utils.py` | Draft-proposal Gumbel noise salted away from rejection/recovery noise | Experiment-only; not mounted by the production profiles |
 | `kv_offload_cpu_gpu_worker.load-war.py` | `vllm/v1/kv_offload/cpu/gpu_worker.py` | Fence CPU→GPU KV restores behind in-flight compute ([#47282](https://github.com/vllm-project/vllm/issues/47282), [PR #47291](https://github.com/vllm-project/vllm/pull/47291)); stage file-backed KV through pinned memory and avoid ROCm 7.2's fault-prone batched host DMA | Required only with `--kv-offloading-backend native` |
-| `offloading-scheduler.dspark-prefix.py` + `kv_lookup_fail_open.py` | `vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py` + sibling module | Exclude DSpark's ephemeral draft group from external reuse and enforce a request deadline/circuit breaker around optional cache lookup and promotion | Required with DSpark + native/tiered KV offload; DSpark handling is based on [#47890](https://github.com/vllm-project/vllm/issues/47890) / [#47891](https://github.com/vllm-project/vllm/pull/47891) |
+| `offloading-scheduler.dspark-prefix.py` + `kv_lookup_fail_open.py` | `vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py` + sibling module | Enforce a request deadline/circuit breaker around optional cache lookup and promotion; also exclude ephemeral draft groups during experiments | Required with the native/tiered KV offload stack; historical DSpark handling is based on [#47890](https://github.com/vllm-project/vllm/issues/47890) / [#47891](https://github.com/vllm-project/vllm/pull/47891) |
 | `async_lookup.bounded.py` + `tiering-fs-bounded-lru.py` + `tiering-fs-manager.disk-reserve.py` | `vllm/v1/kv_offload/tiering/async_lookup.py` + filesystem tier modules | Probe request prefixes in parallel 256-key chunks, cancel obsolete work, track eviction leases per shard, invalidate failed loads, retire only idle LRU shards, and reject stores before consuming the 2 TiB OS reserve | Required with the filesystem tier until upstream makes secondary storage fast, fail-open, and cancellation-aware |
 | `apply-deepseek-v4-reasoning-effort.py` | Patches `vllm/tokenizers/deepseek_v4.py` + `deepseek_v4_encoding.py` at startup | Restore the model revision's native `low`/`high`/`max` prefixes and normalize OpenAI aliases (`minimal→low`, `medium→high`, `xhigh→max`) | Required with pinned vLLM `124154a88`; remove after upstream adopts the 0731 encoding revision |
 | `structural-tag-registry.deepseek-v4-auto.py` | `vllm/tool_parsers/structural_tag_registry.py` | Keep triggered DSML grammar enabled for `tool_choice=auto` + non-strict tools | Required for reliable OpenCode-style tool calls; based on [#40801](https://github.com/vllm-project/vllm/issues/40801) / [#46632](https://github.com/vllm-project/vllm/pull/46632) |
@@ -177,7 +177,10 @@ Most `patches/*.py` files are **full-file overlays** mounted read-only over thei
 
 ### Speculative decoding
 
-This stack uses probabilistic drafting with block rejection. The two Gumbel overlays keep draft-proposal noise independent of rejection and recovery noise.
+Production uses native decoding. DSpark flags and its three runtime overlays are
+absent from both production Compose profiles. The experiment-only files remain
+available for controlled benchmarks but must pass correctness and concurrent
+throughput gates before they can be reintroduced.
 
 ## Performance
 
@@ -185,7 +188,7 @@ This stack uses probabilistic drafting with block rejection. The two Gumbel over
 
 `compose.tp2.yaml` preserves the validated two-MI300X settings: TP=2,
 80 GB of GPU KV cache per worker, 128 active sequences, 4,096-token prefill
-slices, and DSpark-7. It also inherits the lease-safe filesystem cache and
+slices, and native decoding. It also inherits the lease-safe filesystem cache and
 reasoning-effort patch from the base Compose file. On a Hot Aisle host whose
 model cache belongs to the `hotaisle` user, start only inference with:
 
@@ -232,7 +235,8 @@ Distinct ~400-word prompts, streaming, `temperature=1.0, top_p=0.95`; C1–C8 at
 | 8 | 542.3 | 90.3 | 1.027 s |
 | 64 | 830.2 | 16.4 | 2.190 s |
 
-DSpark acceptance is prompt-dependent; treat these as gates for this exact image, not universal model benchmarks.
+The table above was measured with DSpark enabled and is retained as historical
+evidence, not a performance claim for the current native-decoding profile.
 
 ### Prefill
 
@@ -245,7 +249,7 @@ With the tuned kernels, uncached prefill reaches **7.9–8.5K tok/s**, depending
 - **Watch fail-open health, not cache hit rate alone.** Prometheus exports `vllm:kv_offload_fs_request_timeouts_total`, `vllm:kv_offload_fs_circuit_bypasses_total`, `vllm:kv_offload_fs_deferred_requests`, `vllm:kv_offload_fs_oldest_deferred_seconds`, `vllm:kv_offload_fs_circuit_open`, bounded-queue/load-failure counters, eviction state, and free bytes. A timeout is a preserved request, but sustained timeouts mean the disk tier is no longer providing positive value.
 - **Restarts have a 15-second drain bound.** vLLM normally waits for active streams during graceful shutdown. Compose limits that wait so a stuck generation cannot leave a replacement container in `Created`; the public Worker uses OpenRouter for interrupted or unavailable local attempts.
 - **ROCm KV DMA is deliberately submitted per descriptor.** ROCm 7.2's `hipMemcpyBatchAsync` faulted both TP2 ranks while a long session was being staged from GPU KV into pinned host memory. The overlay uses stream-ordered `hipMemcpyAsync` instead. Do not re-enable the batch API without a TP2 long-session store/load stress test; filesystem persistence remains asynchronous above this transfer layer.
-- **The 1,792-token scheduler warning is expected.** DSpark-5 reserves draft slots from the 2,048-token budget. Raising the budget reserves more in-flight sliding-window state and reduces usable KV capacity.
+- **DSpark is disabled in production.** The DSpark-specific overlays remain in the repository for reproducible experiments but are not mounted by either production Compose profile.
 - **Warm the kernels after restart.** The first prefill initializes kernels and takes 5.3 s for 8.9K tokens; subsequent runs take 1.7 s. Run one uncached prefill before admitting traffic.
 - **Test correctness as well as throughput.** The validation suite includes two-turn tool-calling fixtures, a BFCL subset (74–76/90 exact calls), OpenCode tool-schema checks, and 380K-token needle recall on both native and DSpark paths. Cold and cached prefills can take different floating-point paths, so test both.
 

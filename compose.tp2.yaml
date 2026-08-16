@@ -58,7 +58,3 @@ services:
       - triton
       - --linear-backend
       - auto
-      - --speculative-config.method=dspark
-      - --speculative-config.num-speculative-tokens=7
-      - --speculative-config.draft-sample-method=probabilistic
-      - --speculative-config.rejection-sample-method=block
