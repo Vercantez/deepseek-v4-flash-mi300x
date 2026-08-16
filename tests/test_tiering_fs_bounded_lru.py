@@ -154,6 +154,35 @@ class ShardLeaseIndexTests(unittest.TestCase):
             [False],
         )
 
+    def test_sibling_process_index_cannot_evict_a_leased_shard(self) -> None:
+        path = self.make_block("abc")
+        reader = bounded_lru.ShardLeaseIndex(str(self.root))
+        evictor = bounded_lru.ShardLeaseIndex(str(self.root))
+        reader.open_request("req")
+
+        self.assertEqual(
+            reader.lookup_and_pin(
+                "req", [path], lambda paths: [os.path.exists(p) for p in paths]
+            ),
+            [True],
+        )
+        self.assertIsNone(evictor.begin_oldest_eviction())
+
+        reader.release_request("req")
+        self.assertEqual(evictor.begin_oldest_eviction(), self.shard_path("abc"))
+        evictor.finish_eviction(self.shard_path("abc"), False)
+
+    def test_sibling_process_index_cannot_evict_during_store_job(self) -> None:
+        path = self.make_block("abc")
+        writer = bounded_lru.ShardLeaseIndex(str(self.root))
+        evictor = bounded_lru.ShardLeaseIndex(str(self.root))
+
+        self.assertTrue(writer.pin_job(7, [path]))
+        self.assertIsNone(evictor.begin_oldest_eviction())
+        writer.release_job(7)
+        self.assertEqual(evictor.begin_oldest_eviction(), self.shard_path("abc"))
+        evictor.finish_eviction(self.shard_path("abc"), False)
+
     def test_paths_outside_cache_root_are_rejected_without_resolution(self) -> None:
         index = bounded_lru.ShardLeaseIndex(str(self.root))
         outside = str(self.root.parent / "000" / "00_g0" / "block.bin")

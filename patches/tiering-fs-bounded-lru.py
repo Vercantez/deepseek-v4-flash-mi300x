@@ -8,6 +8,7 @@ bounded while still allowing the tier to own eviction safely.
 
 from __future__ import annotations
 
+import fcntl
 import os
 import queue
 import re
@@ -30,6 +31,8 @@ class ShardLeaseIndex:
         self.run_root = os.path.realpath(run_root)
         self._input_root_prefix = self._input_run_root.rstrip(os.sep) + os.sep
         self._root_prefix = self.run_root.rstrip(os.sep) + os.sep
+        self._lock_root = os.path.join(self.run_root, ".locks")
+        os.makedirs(self._lock_root, exist_ok=True)
         self._lock = threading.RLock()
         self._last_used: dict[str, float] = {}
         self._request_shards: dict[str, set[str]] = {}
@@ -39,6 +42,12 @@ class ShardLeaseIndex:
         self._pending_lookup_shards: dict[str, dict[str, int]] = {}
         self._job_shards: dict[int, set[str]] = {}
         self._evicting: set[str] = set()
+        # flock() makes shard leases visible to sibling vLLM processes sharing
+        # this cache.  One descriptor represents all local shared holders; the
+        # reference count preserves the existing request/job lifetime rules.
+        self._shared_lock_fds: dict[str, int] = {}
+        self._shared_lock_counts: dict[str, int] = {}
+        self._eviction_lock_fds: dict[str, int] = {}
         self._dirty_shards: set[str] = set()
         self._last_persisted: dict[str, float] = {}
         # A bounded cancellation fence prevents a late async lookup result
@@ -46,6 +55,35 @@ class ShardLeaseIndex:
         self._closed_requests: OrderedDict[str, None] = OrderedDict()
         self._lookup_cancelled_requests: set[str] = set()
         self._scan_shards()
+
+    def _lock_path(self, shard: str) -> str:
+        return os.path.join(self._lock_root, f"{os.path.basename(shard)}.lock")
+
+    def _acquire_shared_locked(self, shard: str) -> bool:
+        count = self._shared_lock_counts.get(shard, 0)
+        if count:
+            self._shared_lock_counts[shard] = count + 1
+            return True
+        fd = os.open(self._lock_path(shard), os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            return False
+        self._shared_lock_fds[shard] = fd
+        self._shared_lock_counts[shard] = 1
+        return True
+
+    def _release_shared_locked(self, shard: str) -> None:
+        count = self._shared_lock_counts.get(shard, 0)
+        if count > 1:
+            self._shared_lock_counts[shard] = count - 1
+            return
+        self._shared_lock_counts.pop(shard, None)
+        fd = self._shared_lock_fds.pop(shard, None)
+        if fd is not None:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
 
     def _scan_shards(self) -> None:
         try:
@@ -111,7 +149,10 @@ class ShardLeaseIndex:
             shards = [
                 self._shard_for_normalized_path(path) for path in normalized_paths
             ]
-            eligible = [shard not in self._evicting for shard in shards]
+            eligible = [
+                shard not in self._evicting and self._acquire_shared_locked(shard)
+                for shard in shards
+            ]
             pending = self._pending_lookup_shards.setdefault(req_id, {})
             for shard, ok in zip(shards, eligible):
                 if ok:
@@ -137,7 +178,9 @@ class ShardLeaseIndex:
             for shard, hit in zip(shards, hits):
                 if not hit:
                     continue
-                pinned.add(shard)
+                if shard not in pinned:
+                    self._acquire_shared_locked(shard)
+                    pinned.add(shard)
                 self._last_used[shard] = now
                 self._dirty_shards.add(shard)
             return hits
@@ -149,7 +192,11 @@ class ShardLeaseIndex:
         if pending is None:
             return
         for shard in shards:
-            remaining = pending.get(shard, 0) - 1
+            current = pending.get(shard, 0)
+            if current <= 0:
+                continue
+            remaining = current - 1
+            self._release_shared_locked(shard)
             if remaining > 0:
                 pending[shard] = remaining
             else:
@@ -166,6 +213,8 @@ class ShardLeaseIndex:
             ):
                 return
             shard = self.shard_for_path(path)
+            if not self._acquire_shared_locked(shard):
+                return
             pending = self._pending_lookup_shards.setdefault(req_id, {})
             pending[shard] = pending.get(shard, 0) + 1
 
@@ -173,16 +222,22 @@ class ShardLeaseIndex:
         """Resolve and optionally lease a result cached for another request."""
         shard = self.shard_for_path(path)
         with self._lock:
-            self._release_pending_shards_locked(req_id, (shard,))
-            if not hit:
-                return False
-            if (
+            valid_hit = hit and not (
                 req_id in self._closed_requests
                 or req_id in self._lookup_cancelled_requests
                 or shard in self._evicting
-            ):
+            )
+            pinned = self._request_shards.setdefault(req_id, set())
+            if valid_hit and shard not in pinned:
+                # Convert the pending lookup's shared flock into a request
+                # lease before dropping it, so another process cannot evict
+                # the shard between the metadata hit and the load job.
+                valid_hit = self._acquire_shared_locked(shard)
+                if valid_hit:
+                    pinned.add(shard)
+            self._release_pending_shards_locked(req_id, (shard,))
+            if not valid_hit:
                 return False
-            self._request_shards.setdefault(req_id, set()).add(shard)
             self._last_used[shard] = time.time()
             self._dirty_shards.add(shard)
             return True
@@ -209,21 +264,37 @@ class ShardLeaseIndex:
         with self._lock:
             self._closed_requests.pop(req_id, None)
             self._lookup_cancelled_requests.discard(req_id)
-            self._request_shards.setdefault(req_id, set())
-            self._pending_lookup_shards.pop(req_id, None)
+            for shard in self._request_shards.pop(req_id, ()):
+                self._release_shared_locked(shard)
+            pending = self._pending_lookup_shards.pop(req_id, None)
+            if pending:
+                for shard, count in pending.items():
+                    for _ in range(count):
+                        self._release_shared_locked(shard)
+            self._request_shards[req_id] = set()
 
     def cancel_lookup(self, req_id: str, release_pins: bool = True) -> None:
         """Fence late metadata results without closing the request for stores."""
         with self._lock:
             self._lookup_cancelled_requests.add(req_id)
-            self._pending_lookup_shards.pop(req_id, None)
+            pending = self._pending_lookup_shards.pop(req_id, None)
+            if pending:
+                for shard, count in pending.items():
+                    for _ in range(count):
+                        self._release_shared_locked(shard)
             if release_pins:
-                self._request_shards.pop(req_id, None)
+                for shard in self._request_shards.pop(req_id, ()):
+                    self._release_shared_locked(shard)
 
     def release_request(self, req_id: str) -> None:
         with self._lock:
-            self._request_shards.pop(req_id, None)
-            self._pending_lookup_shards.pop(req_id, None)
+            for shard in self._request_shards.pop(req_id, ()):
+                self._release_shared_locked(shard)
+            pending = self._pending_lookup_shards.pop(req_id, None)
+            if pending:
+                for shard, count in pending.items():
+                    for _ in range(count):
+                        self._release_shared_locked(shard)
             self._lookup_cancelled_requests.discard(req_id)
             self._closed_requests[req_id] = None
             self._closed_requests.move_to_end(req_id)
@@ -233,14 +304,24 @@ class ShardLeaseIndex:
     def pin_job(self, job_id: int, paths: Iterable[str]) -> bool:
         shards = {self.shard_for_path(path) for path in paths}
         with self._lock:
+            acquired: list[str] = []
+            for shard in shards:
+                if shard in self._evicting or not self._acquire_shared_locked(shard):
+                    for held in acquired:
+                        self._release_shared_locked(held)
+                    return False
+                acquired.append(shard)
             if shards & self._evicting:
+                for held in acquired:
+                    self._release_shared_locked(held)
                 return False
             self._job_shards[job_id] = shards
             return True
 
     def release_job(self, job_id: int) -> None:
         with self._lock:
-            self._job_shards.pop(job_id, None)
+            for shard in self._job_shards.pop(job_id, ()):
+                self._release_shared_locked(shard)
 
     def record_store(self, paths: Iterable[str]) -> None:
         now = time.time()
@@ -270,21 +351,30 @@ class ShardLeaseIndex:
                 pinned.update(shards)
             for shards in self._pending_lookup_shards.values():
                 pinned.update(shards)
-            candidates = (
+            candidates = sorted(
                 (last_used, shard)
                 for shard, last_used in self._last_used.items()
                 if shard not in pinned and shard not in self._evicting
             )
-            try:
-                _, shard = min(candidates)
-            except ValueError:
-                return None
-            self._evicting.add(shard)
-            return shard
+            for _, shard in candidates:
+                fd = os.open(self._lock_path(shard), os.O_CREAT | os.O_RDWR, 0o600)
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    os.close(fd)
+                    continue
+                self._evicting.add(shard)
+                self._eviction_lock_fds[shard] = fd
+                return shard
+            return None
 
     def finish_eviction(self, shard: str, success: bool) -> None:
         with self._lock:
             self._evicting.discard(shard)
+            fd = self._eviction_lock_fds.pop(shard, None)
+            if fd is not None:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                os.close(fd)
             if success:
                 self._last_used.pop(shard, None)
                 self._dirty_shards.discard(shard)

@@ -36,13 +36,14 @@ This repository adds:
 1. **Correctness overlays** for the pinned ROCm nightly, including fixes not yet in upstream vLLM.
 2. **A validated serving configuration** using native decoding, a 2,048-token scheduler budget, and a 2,048-token long-prefill cap. DSpark is disabled in production to reduce correctness risk and scheduler overhead under concurrency.
 3. **AITER GEMM tuning tables** for the recurring `gfx942` shapes the packaged tables were missing, plus a `gfx942` OGS geometry override for the MXFP4 experts.
-4. **A bounded hybrid KV strategy**: 26 GB of `fp8_ds_mla` GPU cache + 96 GiB native CPU offload + a persistent filesystem tier, with load-path and DSpark prefix fixes carried as overlays. Filesystem eviction is owned by vLLM: active requests and transfers lease their hash shards, the tier retires only idle LRU shards, and a 2 TiB hard reserve keeps inference alive if deletion cannot keep up. External lookups are strictly optional: after a 100 ms minimum budget, the next scheduler opportunity accepts an already-completed lookup or turns a still-pending lookup into a local-prefill cache miss. Only one request may probe filesystem metadata at a time; concurrent requests compute locally. A short circuit breaker prevents unhealthy storage from becoming repeated inference backpressure.
+4. **A bounded hybrid KV strategy**: 26 GB of `fp8_ds_mla` GPU cache + 96 GiB native CPU offload + a persistent filesystem tier, with load-path and DSpark prefix fixes carried as overlays. Filesystem eviction is owned by vLLM: active requests and transfers take cross-process `flock` leases on their hash shards, the tier retires only idle LRU shards, and a 2 TiB hard reserve keeps inference alive if deletion cannot keep up. External lookups are strictly optional: after a 100 ms minimum budget, the next scheduler opportunity accepts an already-completed lookup or turns a still-pending lookup into a local-prefill cache miss. Only one request may probe filesystem metadata at a time; concurrent requests compute locally. A short circuit breaker prevents unhealthy storage from becoming repeated inference backpressure.
 
 ## Repository layout
 
 ```text
 .
 ├── compose.yaml         # The production stack (vLLM ROCm + Caddy), digest-pinned
+├── compose.tp1x2.yaml   # Two independent TP1 replicas for a two-GPU host
 ├── Caddyfile.example    # Copy to Caddyfile; set hostname, email, and source CIDR
 ├── vllm-entrypoint.sh   # Removes stale CPU-KV mmaps from /dev/shm before start
 ├── SHA256SUMS           # SHA-256 pins for every runtime artifact
@@ -186,16 +187,22 @@ throughput gates before they can be reintroduced.
 
 ### Two-GPU deployment
 
-`compose.tp2.yaml` preserves the validated two-MI300X settings: TP=2,
-80 GB of GPU KV cache per worker, 128 active sequences, 4,096-token prefill
-slices, and native decoding. It also inherits the lease-safe filesystem cache and
-reasoning-effort patch from the base Compose file. On a Hot Aisle host whose
-model cache belongs to the `hotaisle` user, start only inference with:
+`compose.tp1x2.yaml` runs two independent copies of the validated single-GPU
+profile. Each process owns one GPU, 26 GB of GPU KV cache, 96 GiB of CPU KV,
+and up to 64 active sequences. Both use the same persistent filesystem cache.
+Block publication is atomic and shard leases use advisory locks in a permanent
+`.locks` directory, so one process cannot evict a shard while the other is
+looking it up, loading it, or writing it.
 
 ```bash
 HF_CACHE=/home/hotaisle/.cache/huggingface \
-  docker compose -f compose.yaml -f compose.tp2.yaml up -d inference
+  docker compose -f compose.tp1x2.yaml up -d
 ```
+
+The replicas publish only on loopback at ports 8000 and 8002. Put both in the
+host proxy's upstream pool. Keep `PYTHONHASHSEED`, model revision, block size,
+KV dtype, and offload configuration identical or they will not share cache
+keys. `compose.tp2.yaml` remains available as the rollback profile.
 
 Key optimizations in the production configuration:
 
