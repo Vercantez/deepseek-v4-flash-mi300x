@@ -523,13 +523,14 @@ class SingleDirectionOffloadingHandler:
         source = transfer.staging.data_ptr()
         offset = 0
         sources = np.empty(len(transfer.host_copy_destinations), dtype=np.uint64)
-        for idx, size in enumerate(transfer.batch_sizes.numpy()):
+        sizes = transfer.batch_sizes.numpy()[: len(transfer.host_copy_destinations)]
+        for idx, size in enumerate(sizes):
             sources[idx] = source + offset
             offset += int(size)
         return copy_host_pages(
             sources,
             transfer.host_copy_destinations,
-            transfer.batch_sizes.numpy(),
+            sizes,
         )
 
 

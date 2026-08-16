@@ -132,7 +132,7 @@
          self._transfer_events.clear()
          self._stream_pool.clear()
          self._event_pool.clear()
-@@ -460,6 +515,23 @@
+@@ -460,6 +515,24 @@
              self._mmap_region.cleanup()
              self._mmap_region = None
  
@@ -144,19 +144,20 @@
 +        source = transfer.staging.data_ptr()
 +        offset = 0
 +        sources = np.empty(len(transfer.host_copy_destinations), dtype=np.uint64)
-+        for idx, size in enumerate(transfer.batch_sizes.numpy()):
++        sizes = transfer.batch_sizes.numpy()[: len(transfer.host_copy_destinations)]
++        for idx, size in enumerate(sizes):
 +            sources[idx] = source + offset
 +            offset += int(size)
 +        return copy_host_pages(
 +            sources,
 +            transfer.host_copy_destinations,
-+            transfer.batch_sizes.numpy(),
++            sizes,
 +        )
 +
  
  class CPUOffloadingWorker(OffloadingWorker):
      """OffloadingWorker for CPU offloading.
-@@ -478,8 +550,16 @@
+@@ -478,8 +551,16 @@
      ):
          pin_memory = PIN_MEMORY
          logger.info("Allocating %d CPU tensors...", len(kv_caches.tensors))
@@ -174,7 +175,7 @@
  
          gpu_tensors: list[torch.Tensor] = []
          cpu_tensors: list[torch.Tensor] = []
-@@ -518,6 +598,7 @@
+@@ -518,6 +599,7 @@
              kv_cache_groups_data_refs=kv_caches.group_data_refs,
              gpu_to_cpu=True,
              mmap_region=mmap_region,
@@ -182,7 +183,7 @@
          )
  
          self._load_handler = SingleDirectionOffloadingHandler(
-@@ -526,6 +607,7 @@
+@@ -526,6 +608,7 @@
              blocks_per_chunk=blocks_per_chunk,
              kv_cache_groups_data_refs=kv_caches.group_data_refs,
              gpu_to_cpu=False,
