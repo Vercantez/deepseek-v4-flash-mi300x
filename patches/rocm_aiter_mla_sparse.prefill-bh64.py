@@ -746,16 +746,21 @@ def rocm_aiter_sparse_attn_indexer(
                 chunk.token_start : chunk.token_end, :topk_tokens
             ]
 
-            selected = min(topk_tokens, logits.shape[-1])
-            selected_indices = torch.topk(logits, selected, dim=-1).indices
-            selected_indices -= chunk.cu_seqlen_ks[:, None]
-            valid = (chunk.cu_seqlen_ke - chunk.cu_seqlen_ks).clamp(max=selected)
-            selected_indices.masked_fill_(
-                torch.arange(selected, device=logits.device)[None] >= valid[:, None],
-                -1,
+            num_rows = logits.shape[0]
+
+            torch.ops._C.top_k_per_row_prefill(
+                logits,
+                chunk.cu_seqlen_ks,
+                chunk.cu_seqlen_ke,
+                topk_indices,
+                num_rows,
+                logits.stride(0),
+                logits.stride(1),
+                topk_tokens,
             )
-            topk_indices.fill_(-1)
-            topk_indices[:, :selected].copy_(selected_indices)
+            # HIP returns the correct set in atomic append order. Canonicalize it
+            # before sparse attention makes reduction order observable.
+            topk_indices.copy_(topk_indices.sort(dim=-1, descending=True).values)
 
     if has_decode:
         decode_metadata = layer_attn_metadata.decode
