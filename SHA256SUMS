@@ -10,7 +10,7 @@ aac1af04f1cc8ddc078baed2e3bf3ae55d1c684b48ec3e4deabc5ac62f9cb85d  compose.tp2.ya
 49c3d8387252ed58551c50883300cb1e7d070833512e110263706b01873506ce  patches/kv_offload_cpu_gpu_worker.load-war.py
 bbf744f2322e16516a3f30bc370d59ead38aecbf0705f027078a40a7a76a30c1  patches/offloading-scheduler.dspark-prefix.py
  8b1d215d9f1ad8d068d42522aefcefe968198cb4be15dd8049d95b201c8c2707  patches/parser-engine-config.dsml-orphan.py
- 9381cc66a834dfd304a7bb449a6dea03c2b9fba79d44aa4662f79fc13bd6c77d  patches/parser-engine.dsml-orphan.py
+d72ab7167ea77937fb7d316877032260bb47764510611d20674d64243692210c  patches/parser-engine.dsml-orphan.py
  0d72534a69c8e226b126714a4682cc1ebde19c083c0fa517f92b463541661f2d  patches/parser-deepseek-v32.dsml-orphan.py
  593b264d804ae8510126631c560055eb973ec22298ecb8e8c8db86fa8cec0eb8  patches/parser-deepseek-v4.dsml-orphan.py
  2ff646bb871fd070a049ea9860ce3e1a24f42e55fd5eba82d37bfde0ebda5d58  patches/mxfp4.fused-silu.py
@@ -41,5 +41,6 @@ e58632922820b42ee233214750060b471c6ee0ab23c298552f801a18d1982a74  patches/tierin
  c63a700f16291b0648489c309dbcb2aa2aaa901aa774c22486822ba1c274af4d  patches/diffs/12-deepseek-dsml-orphan-recovery.patch
 2e7b52af78c0ad73e9cb5242e24fdbbc50d3101de46f46cbe1eed5047b44bbe6  patches/diffs/13-tiering-fs-manager.disk-reserve.patch
 46f3dfb36f34186efd9027e99f284d30dd89333d13d9e67601ebc23789e6fa76  patches/diffs/14-kv-cache-fail-open.patch
+1447158a2b51c0502fad576352e840d575b86eb84894f7ee8470c28c46676518  patches/diffs/15-parser-engine.prompt-opened-reasoning-count.patch
  579eabf2e06fd8d80c7919abbbe66deeddc53a4ba9ae47c263f4ffff6c7575c8  tuning/dsv4-a8w8-blockscale-tuned-gemm.mi300x.prefill-m2688.csv
  0e58ab9227261eb742db5da5eca70c46172ed6ea22b56ababac83f9a95d15bc9  tuning/dsv4-mi300x-a8w8-blockscale-bpreshuffle-ck.prefill-m2688.csv

@@ -32,6 +32,7 @@ generated with `diff -u` on 2026-08-04 against:
 | `apply-deepseek-v4-reasoning-effort.py` | `vllm-project/vllm` @ `124154a8843d1f8e4d4e2d5d466e2d3ebc3716da`; backports the `low`/`high`/`max` prompts published in DeepSeek V4 Flash 0731 model revision `7872f01b1d1fe23eabc4c98b48bffcef5a386062` |
 | `apply-deepseek-v4-indexer-prefill-budget.py` | `vllm-project/vllm` @ `124154a8843d1f8e4d4e2d5d466e2d3ebc3716da`; backports PR #51252 head `1136a8f3d86f708fb71bed77a1c8c7b59a270fbb`, sizing the sparse-indexer prefill budget by `compress_ratio` |
 | `parser-deepseek-v32.dsml-orphan.py`, `parser-deepseek-v4.dsml-orphan.py`, `parser-engine.dsml-orphan.py`, `parser-engine-config.dsml-orphan.py`, `streaming-parser-engine.dsml-orphan.py`, `tool-parser-utils.dsml-orphan.py` | `vllm-project/vllm` @ `124154a8843d1f8e4d4e2d5d466e2d3ebc3716da`; backport of PR #49117 head `7ef0ae2480799e95fb7cb801a8105c1db2585164` |
+| `parser-engine.dsml-orphan.py` reasoning-token follow-up | Incremental adaptation of [PR #49743](https://github.com/vllm-project/vllm/pull/49743) for the streaming parser engine; counts the leading reasoning span when DeepSeek V4's prompt supplies the opening marker and generated tokens contain only the closing marker |
 | `structural-tag-registry.deepseek-v4-auto.py` | `vllm-project/vllm` @ `124154a8843d1f8e4d4e2d5d466e2d3ebc3716da`; adaptation of PR #46632 commit `857187ab10a951270ce1192ead64a14afd4ce41b` |
 
 ## Regenerating a diff
@@ -51,6 +52,11 @@ diff -u --label "a/<upstream path>" --label "b/<overlay>" base.py <overlay>.py
 previous production overlays rather than a pristine upstream file. It groups
 the scheduler deadline, bounded async lookup, failed-load invalidation, and
 filesystem-cache metrics as one availability fix.
+
+`diffs/15-parser-engine.prompt-opened-reasoning-count.patch` is incremental
+against the DSML recovery parser overlay. It mirrors the implicit reasoning
+span behavior from vLLM PR #49743 in the parser-engine counter used by DeepSeek
+V4 Responses streams.
 
 ## Licensing
 

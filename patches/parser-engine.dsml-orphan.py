@@ -649,6 +649,8 @@ class ParserEngine(Parser):
             return 0
         count = 0
         depth = 0
+        if start_id not in token_ids and end_id in token_ids:
+            depth = 1
         for token_id in token_ids:
             if token_id == start_id:
                 depth += 1
