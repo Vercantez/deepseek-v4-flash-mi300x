@@ -39,7 +39,7 @@ services:
       - --block-size
       - "256"
       - --max-model-len
-      - "262144"
+      - "524288"
       - --kv-cache-memory-bytes
       - "80000000000"
       - --kv-offloading-size
