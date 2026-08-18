@@ -8,7 +8,6 @@ services:
     container_name: deepseek-v4-flash-0731-mi300x-0
     environment:
       ROCR_VISIBLE_DEVICES: "0"
-      VLLM_CLEAN_STALE_CPU_KV: "0"
     ports:
       - 127.0.0.1:8000:8000
 
@@ -19,6 +18,5 @@ services:
     container_name: deepseek-v4-flash-0731-mi300x-1
     environment:
       ROCR_VISIBLE_DEVICES: "1"
-      VLLM_CLEAN_STALE_CPU_KV: "0"
     ports:
       - 127.0.0.1:8002:8000

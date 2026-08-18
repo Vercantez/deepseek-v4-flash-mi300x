@@ -5,7 +5,9 @@ services:
     image: vllm/vllm-openai-rocm@sha256:e68d18b2ba50298661bfc49baf01158fbf036645c2362cccf3e8a7a79fe6c69a
     restart: unless-stopped
     init: true
-    ipc: host
+    # Each replica owns a private, sufficiently large /dev/shm. Sharing the
+    # host IPC namespace lets a crashed replica's CPU-KV mmap exhaust its peer.
+    shm_size: "110gb"
     cap_add: [SYS_PTRACE, IPC_LOCK]
     ulimits:
       memlock: -1
