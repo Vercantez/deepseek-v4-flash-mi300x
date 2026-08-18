@@ -4,10 +4,10 @@ Most `*.py` files in this directory are **byte-for-byte the overlays that run in
 production** (see `../SHA256SUMS`). They are mounted read-only over files inside
 the pinned vLLM ROCm container image by `../compose.yaml`.
 
-`apply-deepseek-v4-reasoning-effort.py` is the exception: the entrypoint runs it
-once against two exact, version-checked source blocks. It fails closed if the
-pinned vLLM source changes, avoiding two large tokenizer overlays for a small
-compatibility backport.
+The `apply-deepseek-v4-*.py` source transformers are the exceptions: the
+entrypoint runs them against exact, version-checked source blocks. They fail
+closed if the pinned vLLM source changes, avoiding large tokenizer overlays for
+small compatibility backports.
 
 The `diffs/*.patch` files in this directory are informational unified diffs showing
 exactly what each overlay changes relative to an upstream base revision. They were
@@ -30,6 +30,7 @@ generated with `diff -u` on 2026-08-04 against:
 | `async_lookup.bounded.py` | `vllm-project/vllm` @ `124154a8843d1f8e4d4e2d5d466e2d3ebc3716da` — `vllm/v1/kv_offload/tiering/async_lookup.py`; parallelizes request probes in small fair chunks and makes cancellation or overload a cache miss instead of an unbounded queue |
 | `kv_lookup_fail_open.py` | New dependency-free scheduler policy; enforces the external-cache deadline and circuit breaker and is fault-tested without a GPU |
 | `apply-deepseek-v4-reasoning-effort.py` | `vllm-project/vllm` @ `124154a8843d1f8e4d4e2d5d466e2d3ebc3716da`; backports the `low`/`high`/`max` prompts published in DeepSeek V4 Flash 0731 model revision `7872f01b1d1fe23eabc4c98b48bffcef5a386062` |
+| `apply-deepseek-v4-generation-prompt.py` | `vllm-project/vllm` @ `124154a8843d1f8e4d4e2d5d466e2d3ebc3716da`; backports [PR #46257](https://github.com/vllm-project/vllm/pull/46257) head `8cf0094`, honoring `add_generation_prompt` and `continue_final_message` so assistant-terminated histories do not end at EOS |
 | `apply-deepseek-v4-indexer-prefill-budget.py` | `vllm-project/vllm` @ `124154a8843d1f8e4d4e2d5d466e2d3ebc3716da`; backports PR #51252 head `1136a8f3d86f708fb71bed77a1c8c7b59a270fbb`, sizing the sparse-indexer prefill budget by `compress_ratio` |
 | `parser-deepseek-v32.dsml-orphan.py`, `parser-deepseek-v4.dsml-orphan.py`, `parser-engine.dsml-orphan.py`, `parser-engine-config.dsml-orphan.py`, `streaming-parser-engine.dsml-orphan.py`, `tool-parser-utils.dsml-orphan.py` | `vllm-project/vllm` @ `124154a8843d1f8e4d4e2d5d466e2d3ebc3716da`; backport of PR #49117 head `7ef0ae2480799e95fb7cb801a8105c1db2585164` |
 | `parser-engine.dsml-orphan.py` reasoning-token follow-up | Incremental adaptation of [PR #49743](https://github.com/vllm-project/vllm/pull/49743) for the streaming parser engine; counts the leading reasoning span when DeepSeek V4's prompt supplies the opening marker and generated tokens contain only the closing marker |

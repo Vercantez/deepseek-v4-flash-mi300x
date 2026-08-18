@@ -8,6 +8,7 @@ if [ "${VLLM_CLEAN_STALE_CPU_KV:-1}" = "1" ]; then
 fi
 
 python3 /opt/apply-deepseek-v4-reasoning-effort.py
+python3 /opt/apply-deepseek-v4-generation-prompt.py
 python3 /opt/apply-deepseek-v4-indexer-prefill-budget.py
 
 exec vllm serve "$@"

@@ -28,6 +28,7 @@ services:
       - /var/lib/vllm-kv:/var/cache/vllm-kv
       - ./vllm-entrypoint.sh:/opt/vllm-entrypoint.sh:ro
       - ./patches/apply-deepseek-v4-reasoning-effort.py:/opt/apply-deepseek-v4-reasoning-effort.py:ro
+      - ./patches/apply-deepseek-v4-generation-prompt.py:/opt/apply-deepseek-v4-generation-prompt.py:ro
       - ./patches/apply-deepseek-v4-indexer-prefill-budget.py:/opt/apply-deepseek-v4-indexer-prefill-budget.py:ro
       - ./tuning/dsv4-mi300x-a8w8-blockscale-bpreshuffle-ck.prefill-m2688.csv:/opt/aiter-configs/dsv4-mi300x-a8w8-blockscale-bpreshuffle.csv:ro
       - ./tuning/dsv4-a8w8-blockscale-tuned-gemm.mi300x.prefill-m2688.csv:/usr/local/lib/python3.12/dist-packages/aiter/configs/model_configs/dsv4_a8w8_blockscale_tuned_gemm.csv:ro
