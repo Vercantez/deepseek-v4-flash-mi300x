@@ -1,5 +1,7 @@
 import importlib.util
 import os
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -183,6 +185,23 @@ class ShardLeaseIndexTests(unittest.TestCase):
         self.assertEqual(evictor.begin_oldest_eviction(), self.shard_path("abc"))
         evictor.finish_eviction(self.shard_path("abc"), False)
 
+    def test_promotion_job_replaces_request_lookup_lease(self) -> None:
+        path = self.make_block("abc")
+        index = bounded_lru.ShardLeaseIndex(str(self.root))
+        index.open_request("req")
+        self.assertEqual(
+            index.lookup_and_pin("req", [path], lambda paths: [True]),
+            [True],
+        )
+        self.assertTrue(index.pin_job(7, [path]))
+        index.release_request_pins("req")
+        self.assertIsNone(index.begin_oldest_eviction())
+
+        index.release_job(7)
+        self.assertEqual(index.begin_oldest_eviction(), self.shard_path("abc"))
+        index.finish_eviction(self.shard_path("abc"), False)
+        index.release_request("req")
+
     def test_paths_outside_cache_root_are_rejected_without_resolution(self) -> None:
         index = bounded_lru.ShardLeaseIndex(str(self.root))
         outside = str(self.root.parent / "000" / "00_g0" / "block.bin")
@@ -225,6 +244,90 @@ class ShardLeaseIndexTests(unittest.TestCase):
         self.assertEqual(len(results), 1)
         self.assertTrue(results[0][1], results)
         self.assertEqual(worker.outstanding, 0)
+
+
+class SharedEvictionGateTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.root = Path(self.tempdir.name)
+
+    def tearDown(self) -> None:
+        self.tempdir.cleanup()
+
+    def test_sibling_owner_blocks_stores_until_eviction_finishes(self) -> None:
+        owner = bounded_lru.SharedEvictionGate(str(self.root))
+        sibling = bounded_lru.SharedEvictionGate(str(self.root))
+        self.assertTrue(owner.try_begin_eviction())
+        self.assertTrue(owner.try_fence_writes())
+        self.assertTrue(sibling.eviction_active)
+        self.assertFalse(sibling.try_pin_store(1))
+
+        owner.finish_eviction()
+        self.assertFalse(sibling.eviction_active)
+        self.assertTrue(sibling.try_pin_store(1))
+        sibling.release_store(1)
+        owner.close()
+        sibling.close()
+
+    def test_eviction_waits_for_sibling_store_then_fences_new_stores(self) -> None:
+        writer = bounded_lru.SharedEvictionGate(str(self.root))
+        owner = bounded_lru.SharedEvictionGate(str(self.root))
+        sibling = bounded_lru.SharedEvictionGate(str(self.root))
+        self.assertTrue(writer.try_pin_store(7))
+        self.assertTrue(owner.try_begin_eviction())
+        self.assertFalse(owner.try_fence_writes())
+        self.assertFalse(sibling.try_pin_store(8))
+
+        writer.release_store(7)
+        self.assertTrue(owner.try_fence_writes())
+        self.assertFalse(sibling.try_pin_store(9))
+        owner.finish_eviction()
+        self.assertTrue(sibling.try_pin_store(10))
+        sibling.release_store(10)
+        writer.close()
+        owner.close()
+        sibling.close()
+
+    def test_only_one_process_can_own_eviction(self) -> None:
+        first = bounded_lru.SharedEvictionGate(str(self.root))
+        second = bounded_lru.SharedEvictionGate(str(self.root))
+        self.assertTrue(first.try_begin_eviction())
+        self.assertFalse(second.try_begin_eviction())
+        first.finish_eviction()
+        self.assertTrue(second.try_begin_eviction())
+        first.close()
+        second.close()
+
+    def test_crashed_owner_releases_shared_gate(self) -> None:
+        script = f"""
+import importlib.util
+import sys
+spec = importlib.util.spec_from_file_location("bounded_lru_child", {str(MODULE_PATH)!r})
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+gate = module.SharedEvictionGate(sys.argv[1])
+assert gate.try_begin_eviction()
+assert gate.try_fence_writes()
+print("ready", flush=True)
+sys.stdin.buffer.read(1)
+"""
+        with subprocess.Popen(
+            [sys.executable, "-c", script, str(self.root)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+        ) as child:
+            assert child.stdout is not None
+            self.assertEqual(child.stdout.readline().strip(), "ready")
+            sibling = bounded_lru.SharedEvictionGate(str(self.root))
+            self.assertTrue(sibling.eviction_active)
+            self.assertFalse(sibling.try_pin_store(1))
+
+            child.kill()
+            child.wait(timeout=5)
+            self.assertFalse(sibling.eviction_active)
+            self.assertTrue(sibling.try_begin_eviction())
+            sibling.close()
 
 
 if __name__ == "__main__":

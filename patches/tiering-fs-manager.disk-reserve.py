@@ -63,6 +63,7 @@ from vllm.v1.kv_offload.tiering.fs.io import (
     probe_o_direct,
 )
 from vllm.v1.kv_offload.tiering.fs.bounded_lru import (
+    SharedEvictionGate,
     ShardEvictionWorker,
     ShardLeaseIndex,
 )
@@ -358,16 +359,22 @@ class FileSystemTierManager(SecondaryTierManager):
         block_run_root = f"{self.file_mapper.base_path}_r{self.file_mapper.rank}"
         os.makedirs(block_run_root, exist_ok=True)
         self._leases = ShardLeaseIndex(block_run_root)
+        self._eviction_gate = SharedEvictionGate(block_run_root)
         self._eviction_worker = (
             ShardEvictionWorker() if self._eviction_trigger_bytes else None
         )
+        self._orphan_tombstones: deque[str] = deque()
         if self._eviction_worker is not None:
             with os.scandir(block_run_root) as entries:
                 for entry in entries:
                     if entry.is_dir(follow_symlinks=False) and entry.name.startswith(
                         ".evicting-"
                     ):
-                        self._eviction_worker.submit(entry.path)
+                        # A previous process died after atomically removing a
+                        # shard from the live namespace. Cleanup still consumes
+                        # disk bandwidth, so defer it until this process owns
+                        # the same host-wide write fence as normal eviction.
+                        self._orphan_tombstones.append(entry.path)
         self._store_job_paths: dict[JobId, list[str]] = {}
         self._load_job_paths: dict[JobId, list[str]] = {}
         self._load_job_keys: dict[JobId, list[OffloadKey]] = {}
@@ -486,24 +493,44 @@ class FileSystemTierManager(SecondaryTierManager):
         if worker is None:
             return
         available = self._get_available_bytes()
-        if not self._eviction_active and available < self._eviction_trigger_bytes:
-            self._eviction_active = True
-            logger.warning(
-                "Filesystem KV cache reached %d GiB free; retiring idle LRU "
-                "shards until %d GiB is free.",
-                available // 1024**3,
-                self._eviction_target_bytes // 1024**3,
-            )
+        needs_owner = bool(self._orphan_tombstones) or (
+            available < self._eviction_trigger_bytes
+        )
+        if not self._eviction_active and needs_owner:
+            if self._eviction_gate.try_begin_eviction():
+                self._eviction_active = True
+                logger.warning(
+                    "Filesystem KV cache reached %d GiB free; this process "
+                    "owns shared eviction until %d GiB is free.",
+                    available // 1024**3,
+                    self._eviction_target_bytes // 1024**3,
+                )
         if not self._eviction_active:
+            return
+        # Do not lift the shared write fence while a deletion is in flight.
+        if worker.outstanding or self._leases.evictions_in_flight:
+            return
+        while self._orphan_tombstones and not os.path.exists(
+            self._orphan_tombstones[0]
+        ):
+            self._orphan_tombstones.popleft()
+        if self._orphan_tombstones:
+            if not self._eviction_gate.try_fence_writes():
+                return
+            worker.submit(self._orphan_tombstones.popleft())
             return
         if available >= self._eviction_target_bytes:
             self._eviction_active = False
+            self._eviction_gate.finish_eviction()
             logger.info(
                 "Filesystem KV-cache eviction restored %d GiB free.",
                 available // 1024**3,
             )
             return
-        if self._leases.evictions_in_flight:
+        # The intent lock already prevents new stores in every sibling process.
+        # Wait non-blockingly for previously admitted stores to finish before
+        # allowing shard deletion to compete for the shared filesystem.
+        if not self._eviction_gate.try_fence_writes():
             return
         shard = self._leases.begin_oldest_eviction()
         if shard is None:
@@ -524,16 +551,18 @@ class FileSystemTierManager(SecondaryTierManager):
         # Never make foreground inference compete with simultaneous cache
         # writes and shard deletion. Existing disk entries remain readable;
         # stores resume automatically after eviction reaches its target.
-        if self._eviction_active:
+        if not self._eviction_gate.try_pin_store(job_metadata.job_id):
             self._store_eviction_bypass_delta += 1
             self._failed_jobs.append(job_metadata.job_id)
             return
         paths = [self.file_mapper.get_file_name(key) for key in job_metadata.keys]
         required_bytes = len(paths) * self._block_size
         if not self._has_store_space(required_bytes):
+            self._eviction_gate.release_store(job_metadata.job_id)
             self._failed_jobs.append(job_metadata.job_id)
             return
         if not self._leases.pin_job(job_metadata.job_id, paths):
+            self._eviction_gate.release_store(job_metadata.job_id)
             self._failed_jobs.append(job_metadata.job_id)
             return
         self._store_job_paths[job_metadata.job_id] = paths
@@ -556,16 +585,23 @@ class FileSystemTierManager(SecondaryTierManager):
             self._store_job_reserved_bytes.pop(job_metadata.job_id, None)
             self._reserved_store_bytes -= required_bytes
             self._leases.release_job(job_metadata.job_id)
+            self._eviction_gate.release_store(job_metadata.job_id)
             raise
 
     @override
     def submit_load(self, job_metadata: JobMetadata) -> None:
         paths = [self.file_mapper.get_file_name(key) for key in job_metadata.keys]
         if not self._leases.pin_job(job_metadata.job_id, paths):
+            self._leases.release_request_pins(job_metadata.req_context.req_id)
             self._lookup_manager.invalidate(job_metadata.keys)
             self._load_failure_delta += 1
             self._failed_jobs.append(job_metadata.job_id)
             return
+        # The promotion job now owns shard leases for every filesystem block
+        # it will read. Request-level lookup leases are no longer needed and,
+        # for long prompts, can otherwise pin nearly all 4,096 shards through
+        # the entire decode and starve eviction indefinitely.
+        self._leases.release_request_pins(job_metadata.req_context.req_id)
         self._load_job_paths[job_metadata.job_id] = paths
         self._load_job_keys[job_metadata.job_id] = list(job_metadata.keys)
         task = functools.partial(
@@ -603,6 +639,7 @@ class FileSystemTierManager(SecondaryTierManager):
             reserved_bytes = self._store_job_reserved_bytes.pop(job_id, 0)
             self._reserved_store_bytes -= reserved_bytes
             self._leases.release_job(job_id)
+            self._eviction_gate.release_store(job_id)
             if success and store_paths:
                 self._leases.record_store(store_paths)
             if success and load_paths:
@@ -659,7 +696,8 @@ class FileSystemTierManager(SecondaryTierManager):
             self._lookup_manager.pending_keys,
         )
         self._stats.set_gauge(
-            FileSystemTierMetrics.EVICTION_ACTIVE, int(self._eviction_active)
+            FileSystemTierMetrics.EVICTION_ACTIVE,
+            int(self._eviction_gate.eviction_active),
         )
         self._stats.set_gauge(
             FileSystemTierMetrics.EVICTIONS_IN_FLIGHT,
@@ -713,3 +751,4 @@ class FileSystemTierManager(SecondaryTierManager):
         self._pool.shutdown(wait=True)
         if self._eviction_worker is not None:
             self._eviction_worker.shutdown()
+        self._eviction_gate.close()

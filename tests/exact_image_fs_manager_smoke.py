@@ -91,6 +91,9 @@ def main() -> None:
         )
         wait_for_jobs(tier)
         np.testing.assert_array_equal(backing[1], expected)
+        assert not tier._leases._request_shards[ctx.req_id], (
+            "promotion completion left request-level shard leases pinned"
+        )
 
         # A corrupt secondary block must become a miss after one failed load,
         # not a cached HIT that is promoted forever on every scheduler step.
@@ -121,6 +124,10 @@ def main() -> None:
             kv_events_config=SimpleNamespace(enable_kv_cache_events=False),
         )
         backing = np.zeros((2, 4096), dtype=np.uint8)
+        orphan = os.path.join(f"{mapper.base_path}_r0", ".evicting-abc-crash")
+        os.makedirs(orphan, exist_ok=True)
+        with open(os.path.join(orphan, "stale.bin"), "wb") as output:
+            output.write(b"stale")
         tier = manager_module.FileSystemTierManager(
             offloading_spec=spec,
             primary_kv_view=memoryview(backing),
@@ -146,9 +153,13 @@ def main() -> None:
         tier._get_available_bytes = lambda force=False: 0
         tier._maybe_schedule_eviction()
         deadline = time.monotonic() + 5
-        while tier._eviction_worker.outstanding and time.monotonic() < deadline:
+        while time.monotonic() < deadline:
             time.sleep(0.01)
             tier._drain_evictions()
+            tier._maybe_schedule_eviction()
+            if not os.path.exists(orphan) and not os.path.exists(path_b):
+                break
+        assert not os.path.exists(orphan), "orphan tombstone was not cleaned"
         assert os.path.exists(path_a), "leased hot shard was evicted"
         assert not os.path.exists(path_b), "idle cold shard was not evicted"
 

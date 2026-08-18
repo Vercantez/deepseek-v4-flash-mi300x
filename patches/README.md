@@ -25,7 +25,7 @@ generated with `diff -u` on 2026-08-04 against:
 | `dspark-speculator.independent-draft-gumbel.py` | `vllm-project/vllm` `main` @ `cb8104839c141609d99f1254459ef3a4f1bd4263` — `vllm/v1/worker/gpu/spec_decode/dspark/speculator.py` |
 | `spec-decode-utils.independent-draft-gumbel.py` | `vllm-project/vllm` `main` @ `cb8104839c141609d99f1254459ef3a4f1bd4263` — `vllm/v1/worker/gpu/spec_decode/utils.py` |
 | `kv_offload_cpu_gpu_worker.load-war.py` | `vllm-project/vllm` `main` @ `cb8104839c141609d99f1254459ef3a4f1bd4263` — `vllm/v1/kv_offload/cpu/gpu_worker.py` (post-#46278 state; PR #47291 is not merged upstream) |
-| `tiering-fs-bounded-lru.py` | New companion module for the filesystem manager overlay; implements compact shard-level lookup leases, cancellation fences, and background atomic LRU eviction without modifying upstream package initialization |
+| `tiering-fs-bounded-lru.py` | New companion module for the filesystem manager overlay; implements compact shard-level lookup leases, cancellation fences, crash-safe cross-process eviction/write coordination, and background atomic LRU eviction without modifying upstream package initialization |
 | `tiering-fs-manager.disk-reserve.py` | `vllm-project/vllm` @ `124154a8843d1f8e4d4e2d5d466e2d3ebc3716da` — `vllm/v1/kv_offload/tiering/fs/manager.py` |
 | `async_lookup.bounded.py` | `vllm-project/vllm` @ `124154a8843d1f8e4d4e2d5d466e2d3ebc3716da` — `vllm/v1/kv_offload/tiering/async_lookup.py`; parallelizes request probes in small fair chunks and makes cancellation or overload a cache miss instead of an unbounded queue |
 | `kv_lookup_fail_open.py` | New dependency-free scheduler policy; enforces the external-cache deadline and circuit breaker and is fault-tested without a GPU |

@@ -23,6 +23,145 @@ _SHARD_NAME = re.compile(r"^[0-9a-f]{3}$")
 _TOMBSTONE_PREFIX = ".evicting-"
 
 
+class SharedEvictionGate:
+    """Coordinate stores and eviction across processes sharing one cache.
+
+    Eviction uses two advisory locks.  The elected owner first takes the
+    intent lock exclusively, which prevents sibling processes from admitting
+    new stores.  It then takes the write lock exclusively after already
+    admitted stores release their shared leases.  Holding both locks makes
+    shard deletion mutually exclusive with filesystem writes without ever
+    blocking the vLLM scheduler thread.
+
+    ``flock`` locks are released by the kernel when a process exits, so a
+    crashed eviction owner cannot leave the cache permanently read-only.
+    """
+
+    def __init__(self, run_root: str) -> None:
+        lock_root = os.path.join(os.path.realpath(run_root), ".locks")
+        os.makedirs(lock_root, exist_ok=True)
+        self._intent_fd = os.open(
+            os.path.join(lock_root, "eviction-intent.lock"),
+            os.O_CREAT | os.O_RDWR,
+            0o600,
+        )
+        self._intent_probe_fd = os.open(
+            os.path.join(lock_root, "eviction-intent.lock"),
+            os.O_CREAT | os.O_RDWR,
+            0o600,
+        )
+        self._write_fd = os.open(
+            os.path.join(lock_root, "eviction-writes.lock"),
+            os.O_CREAT | os.O_RDWR,
+            0o600,
+        )
+        self._eviction_write_fd = os.open(
+            os.path.join(lock_root, "eviction-writes.lock"),
+            os.O_CREAT | os.O_RDWR,
+            0o600,
+        )
+        self._lock = threading.RLock()
+        self._owns_eviction = False
+        self._writes_fenced = False
+        self._store_jobs: set[int] = set()
+        self._store_lease_held = False
+        self._closed = False
+
+    @staticmethod
+    def _try_lock(fd: int, operation: int) -> bool:
+        try:
+            fcntl.flock(fd, operation | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        return True
+
+    def try_begin_eviction(self) -> bool:
+        """Become the sole eviction owner, without waiting on another process."""
+        with self._lock:
+            if self._owns_eviction:
+                return True
+            if not self._try_lock(self._intent_fd, fcntl.LOCK_EX):
+                return False
+            self._owns_eviction = True
+            return True
+
+    def try_fence_writes(self) -> bool:
+        """Fence disk writes after all previously admitted stores have drained."""
+        with self._lock:
+            if not self._owns_eviction:
+                return False
+            if self._writes_fenced:
+                return True
+            if not self._try_lock(self._eviction_write_fd, fcntl.LOCK_EX):
+                return False
+            self._writes_fenced = True
+            return True
+
+    def try_pin_store(self, job_id: int) -> bool:
+        """Admit one store and hold a shared write lease through completion."""
+        with self._lock:
+            if self._closed or self._owns_eviction:
+                return False
+            # Keep the shared intent lock until the write lease is acquired.
+            # An evictor therefore cannot slip between the two checks.
+            if not self._try_lock(self._intent_probe_fd, fcntl.LOCK_SH):
+                return False
+            try:
+                if not self._store_lease_held:
+                    if not self._try_lock(self._write_fd, fcntl.LOCK_SH):
+                        return False
+                    self._store_lease_held = True
+                self._store_jobs.add(job_id)
+                return True
+            finally:
+                fcntl.flock(self._intent_probe_fd, fcntl.LOCK_UN)
+
+    def release_store(self, job_id: int) -> None:
+        with self._lock:
+            self._store_jobs.discard(job_id)
+            if self._store_lease_held and not self._store_jobs:
+                fcntl.flock(self._write_fd, fcntl.LOCK_UN)
+                self._store_lease_held = False
+
+    @property
+    def eviction_active(self) -> bool:
+        """Return whether this or a sibling process owns eviction."""
+        with self._lock:
+            if self._owns_eviction:
+                return True
+            if not self._try_lock(self._intent_probe_fd, fcntl.LOCK_SH):
+                return True
+            fcntl.flock(self._intent_probe_fd, fcntl.LOCK_UN)
+            return False
+
+    def finish_eviction(self) -> None:
+        with self._lock:
+            if self._writes_fenced:
+                fcntl.flock(self._eviction_write_fd, fcntl.LOCK_UN)
+                self._writes_fenced = False
+            if self._owns_eviction:
+                fcntl.flock(self._intent_fd, fcntl.LOCK_UN)
+                self._owns_eviction = False
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self.finish_eviction()
+            if self._store_lease_held:
+                fcntl.flock(self._write_fd, fcntl.LOCK_UN)
+                self._store_lease_held = False
+            self._store_jobs.clear()
+            for fd in (
+                self._intent_fd,
+                self._intent_probe_fd,
+                self._write_fd,
+                self._eviction_write_fd,
+            ):
+                os.close(fd)
+            self._closed = True
+
+
 class ShardLeaseIndex:
     """LRU metadata and leases shared by lookup, transfer, and eviction paths."""
 
@@ -283,13 +422,24 @@ class ShardLeaseIndex:
                     for _ in range(count):
                         self._release_shared_locked(shard)
             if release_pins:
-                for shard in self._request_shards.pop(req_id, ()):
-                    self._release_shared_locked(shard)
+                self._release_request_pins_locked(req_id)
+
+    def _release_request_pins_locked(self, req_id: str) -> None:
+        for shard in self._request_shards.get(req_id, ()):
+            self._release_shared_locked(shard)
+        # Preserve the open request entry so later lookup batches can safely
+        # acquire fresh pins before the request lifecycle ends.
+        self._request_shards[req_id] = set()
+
+    def release_request_pins(self, req_id: str) -> None:
+        """Release lookup leases after promotion jobs own their shard leases."""
+        with self._lock:
+            self._release_request_pins_locked(req_id)
 
     def release_request(self, req_id: str) -> None:
         with self._lock:
-            for shard in self._request_shards.pop(req_id, ()):
-                self._release_shared_locked(shard)
+            self._release_request_pins_locked(req_id)
+            self._request_shards.pop(req_id, None)
             pending = self._pending_lookup_shards.pop(req_id, None)
             if pending:
                 for shard, count in pending.items():
