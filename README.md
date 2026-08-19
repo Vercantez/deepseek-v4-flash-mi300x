@@ -159,7 +159,7 @@ Most `patches/*.py` files are **full-file overlays** mounted read-only over thei
 | `mxfp4.fused-silu.py` | `vllm/.../fused_moe/oracle/mxfp4.py` | Gate/up interleave layout for the fused-SiLU kernel | Required with the fused-SiLU overlay; skip both if you keep the standard SiLU path |
 | `triton-kernels-matmul-ogs-opt-flags.dsv4-mi300x.py` | `vllm/third_party/triton_kernels/matmul_ogs_details/opt_flags.py` | `gfx942` MXFP4 OGS tile geometry (up to 1,536 routed rows) | **Performance** on `gfx942`; the stock geometry slows sharply above 768 routed rows |
 | `fused_compress_quant_cache.fnuz-shuffle.py` | `vllm/models/deepseek_v4/common/ops/fused_compress_quant_cache.py` | **FNUZ FP8 + 16×16 preshuffle** in the Lightning Indexer cache writer | **Required on MI300X**; MI325X/MI355X use OCP FP8 and must keep the stock bytes |
-| `aiter_pa_mqa_logits.i64.py` | `aiter/ops/triton/gluon/pa_mqa_logits.py` | 64-bit offsets in the `ChunkK=256` paged-MQA kernels | Required when KV offsets can exceed 4 GiB; skip for small KV pools |
+| `aiter_pa_mqa_logits.i64.py` | `aiter/ops/triton/gluon/pa_mqa_logits.py` | 64-bit K/scale gathers in both non-variable-context `ChunkK=256` preshuffle pipelines | Required when KV offsets can exceed 2 GiB; includes the `KVBlockSize=256` production specialization not covered by AITER PR #4774 |
 | `rocm_aiter_mla_sparse.prefill-bh64.py` | `vllm/v1/attention/ops/rocm_aiter_mla_sparse.py` | Upstream bounded prefill top-k selection with canonical ordering + `BLOCK_H=64` head-512 sparse prefill | Upstream row-bound handling is required for correctness; canonical ordering supports reproducible tool calls; `BLOCK_H=64` is performance |
 | `rocm_aiter_mla.dspark-causal.py` | `vllm/v1/attention/backends/mla/rocm_aiter_mla.py` | Causal multi-token speculative verification | Experiment-only; not mounted by the production profiles |
 | `dspark-speculator.independent-draft-gumbel.py` + `spec-decode-utils.independent-draft-gumbel.py` | `vllm/v1/worker/gpu/spec_decode/dspark/speculator.py` + `.../spec_decode/utils.py` | Draft-proposal Gumbel noise salted away from rejection/recovery noise | Experiment-only; not mounted by the production profiles |
@@ -172,11 +172,20 @@ Most `patches/*.py` files are **full-file overlays** mounted read-only over thei
 | `structural-tag-registry.deepseek-v4-auto.py` | `vllm/tool_parsers/structural_tag_registry.py` | Keep triggered DSML grammar enabled for `tool_choice=auto` + non-strict tools | Required for reliable OpenCode-style tool calls; based on [#40801](https://github.com/vllm-project/vllm/issues/40801) / [#46632](https://github.com/vllm-project/vllm/pull/46632) |
 | `parser-*.dsml-orphan.py` + `tool-parser-utils.dsml-orphan.py` | `vllm/parser/...` + `vllm/tool_parsers/utils.py` | Recover declared DSML invokes when the model omits the outer `tool_calls` wrapper; count prompt-opened reasoning spans in Responses usage | Required for long-context agent sessions; backported from [#49117](https://github.com/vllm-project/vllm/pull/49117) with the reasoning-count adaptation from [#49743](https://github.com/vllm-project/vllm/pull/49743) |
 
-### Two important correctness fixes
+### Three important correctness fixes
 
 **MXFP4 routing.** The MoE bitmatrix kernel pads its block columns to a Triton block size, but the padding lanes were masked against the global tensor bound instead of the logical block size. Under load, padded lanes corrupted the routing matrix, causing near-match tool names and forgotten schemas on long prompts. The one-line fix is `mask = (offs_local < BLOCK_SIZE) & (offs_global < nonzero_indx_size)`, taken from [Doubleword commit `c32932bb9`](https://github.com/doublewordai/vllm-amd-blog-doubleword/commit/c32932bb9ff6ad30b942e4835dd8b41601e7569e). The overlay also includes fused-SiLU and fast-routing changes for grouped MXFP4 experts.
 
 **FP8 format.** DeepSeek V4's Lightning Indexer cache uses FP8. The stock writer emits OCP E4M3 bytes in row-major order, while AITER on MI300X consumes AMD FNUZ E4M3 bytes in a preshuffled 16×16 tile layout. In the worst case, interpreting one format as the other produces a factor-of-two scale error. The overlay selects `float8e4b8` with `FP8_MAX=224.0` and shuffled write offsets on ROCm, while leaving the OCP path unchanged elsewhere.
+
+**Paged-indexer addressing.** AITER's gfx942 preshuffle kernel originally
+formed K and scale addresses with 32-bit `buffer_load` offsets. The shared
+DeepSeek V4 cache stride crosses that range at modest physical block IDs,
+silently returning zero indexer logits and making sparse top-k selection
+allocation-dependent. [AITER PR #4774](https://github.com/ROCm/aiter/pull/4774)
+fixed the pipeline used by smaller cache blocks; this overlay also converts the
+alternate pipeline selected by production's `ChunkK=256` and
+`KVBlockSize=256` to 64-bit `gl.load` pointer arithmetic.
 
 ### Speculative decoding
 

@@ -59,6 +59,11 @@ against the DSML recovery parser overlay. It mirrors the implicit reasoning
 span behavior from vLLM PR #49743 in the parser-engine counter used by DeepSeek
 V4 Responses streams.
 
+`diffs/16-aiter-pa-mqa-block256-i64.patch` is incremental against the previous
+AITER overlay. It converts the alternate non-variable-context preshuffle
+pipeline selected by production's `ChunkK=256`, `KVBlockSize=256` combination;
+the earlier overlay covered only the other branch.
+
 ## Licensing
 
 Overlays derived from vLLM carry vLLM's Apache-2.0 headers. The AITER-derived
