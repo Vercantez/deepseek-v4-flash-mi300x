@@ -32,9 +32,10 @@ generated with `diff -u` on 2026-08-04 against:
 | `apply-deepseek-v4-reasoning-effort.py` | `vllm-project/vllm` @ `124154a8843d1f8e4d4e2d5d466e2d3ebc3716da`; backports the `low`/`high`/`max` prompts published in DeepSeek V4 Flash 0731 model revision `7872f01b1d1fe23eabc4c98b48bffcef5a386062` |
 | `apply-deepseek-v4-generation-prompt.py` | `vllm-project/vllm` @ `124154a8843d1f8e4d4e2d5d466e2d3ebc3716da`; backports [PR #46257](https://github.com/vllm-project/vllm/pull/46257) head `8cf0094`, honoring `add_generation_prompt` and `continue_final_message` so assistant-terminated histories do not end at EOS |
 | `apply-deepseek-v4-indexer-prefill-budget.py` | `vllm-project/vllm` @ `124154a8843d1f8e4d4e2d5d466e2d3ebc3716da`; backports PR #51252 head `1136a8f3d86f708fb71bed77a1c8c7b59a270fbb`, sizing the sparse-indexer prefill budget by `compress_ratio` |
-| `parser-deepseek-v32.dsml-orphan.py`, `parser-deepseek-v4.dsml-orphan.py`, `parser-engine.dsml-orphan.py`, `parser-engine-config.dsml-orphan.py`, `streaming-parser-engine.dsml-orphan.py`, `tool-parser-utils.dsml-orphan.py` | `vllm-project/vllm` @ `124154a8843d1f8e4d4e2d5d466e2d3ebc3716da`; backport of PR #49117 head `7ef0ae2480799e95fb7cb801a8105c1db2585164` |
+| `apply-deepseek-v4-parser-recovery.py` | `vllm-project/vllm` @ `124154a8843d1f8e4d4e2d5d466e2d3ebc3716da`; synchronizes request tools into the engine-based reasoning adapter before extraction, adapting the reviewed approach in PR #52645 head `4f2aae22cd043e7c9384f578a9e546ec848abe73` |
+| `parser-deepseek-v32.dsml-orphan.py`, `parser-deepseek-v4.dsml-orphan.py`, `parser-engine.dsml-orphan.py`, `parser-engine-config.dsml-orphan.py`, `streaming-parser-engine.dsml-orphan.py`, `tool-parser-utils.dsml-orphan.py` | `vllm-project/vllm` @ `124154a8843d1f8e4d4e2d5d466e2d3ebc3716da`; backport of PR #49117 head `7ef0ae2480799e95fb7cb801a8105c1db2585164`, hardened so a recovery remains provisional until the full invoke closes, based on PR #52645 head `4f2aae22cd043e7c9384f578a9e546ec848abe73` |
 | `parser-engine.dsml-orphan.py` reasoning-token follow-up | Incremental adaptation of [PR #49743](https://github.com/vllm-project/vllm/pull/49743) for the streaming parser engine; counts the leading reasoning span when DeepSeek V4's prompt supplies the opening marker and generated tokens contain only the closing marker |
-| `parser-deepseek-v4.dsml-orphan.py` reasoning-orphan follow-up | Incremental close of [PR #49117](https://github.com/vllm-project/vllm/pull/49117) limitation 2: recover a declared DSML invoke that starts in prompt-opened `REASONING` when the model omits both `</think>` and the `tool_calls` wrapper. Name validation is unchanged. |
+| `parser-deepseek-v4.dsml-orphan.py` reasoning-orphan follow-up | Incremental close of [PR #49117](https://github.com/vllm-project/vllm/pull/49117) limitation 2: recover a declared DSML invoke that starts in prompt-opened `REASONING` when the model omits both `</think>` and the `tool_calls` wrapper. Recovery is now fail-closed through the full invoke and request-aware in the reasoning adapter. |
 | `structural-tag-registry.deepseek-v4-auto.py` | `vllm-project/vllm` @ `124154a8843d1f8e4d4e2d5d466e2d3ebc3716da`; adaptation of PR #46632 commit `857187ab10a951270ce1192ead64a14afd4ce41b` |
 
 ## Regenerating a diff
@@ -63,9 +64,15 @@ V4 Responses streams.
 `diffs/17-parser-deepseek-v4.reasoning-orphan.patch` is incremental against the
 DSML recovery V4 parser overlay. It adds `(ParserState.REASONING,
 "INVOKE_PREFIX")` so a thinking request that never leaves reasoning can still
-recover a declared `apply_patch` (or any other declared tool). Undeclared
-names, `tool_choice=none`, the existing `TOOL_START` implicit-end path, and
-content-state recovery after `</think>` are unchanged.
+begin recovery of a declared `apply_patch` (or any other declared tool).
+
+`diffs/18-parser-dsml-provisional-recovery.patch` supersedes the eager behavior
+in diff 17. It keeps all semantic events provisional until `</invoke>`, rolls
+truncated or malformed candidates back as text, validates each later bare
+invoke independently, preserves suffix content, and synchronizes request tools
+through the separately configured reasoning adapter. The design follows the
+reviewed hardening in vLLM PR #52645 while remaining compatible with the pinned
+`124154a88` runtime.
 
 `diffs/16-aiter-pa-mqa-block256-i64.patch` is incremental against the previous
 AITER overlay. It converts the alternate non-variable-context preshuffle

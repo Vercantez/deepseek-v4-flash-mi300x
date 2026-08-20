@@ -421,11 +421,12 @@ class ParserEngine(Parser):
             # field, so it has to be cleared here.  Otherwise a request
             # that declares no tools would inherit the names of the
             # previous one and could recover a tool it never asked for.
+            self._tools = None
             self._engine.allowed_tool_names = None
-        if not self.skip_tool_parsing and not self._suppress_tool_calls:
-            tool_choice = getattr(request, "tool_choice", None)
-            if tool_choice == "none" and tools:
-                self._suppress_tool_calls = True
+        # This parser object can be reused. Derive suppression from the
+        # current request instead of retaining tool_choice="none" forever.
+        tool_choice = getattr(request, "tool_choice", None)
+        self._suppress_tool_calls = tool_choice == "none" and bool(tools)
         # The engine needs the suppression state too: recovery
         # transitions must not consume text that will never be allowed
         # to become a tool call.

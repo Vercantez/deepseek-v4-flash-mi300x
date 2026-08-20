@@ -288,6 +288,11 @@ def _install_parser_stubs() -> None:
         PATCHES / "parser-deepseek-v4.dsml-orphan.py",
     )
     sys.modules["vllm.parser.deepseek_v4"] = v4
+    v32 = _load_overlay(
+        "vllm.parser.deepseek_v32",
+        PATCHES / "parser-deepseek-v32.dsml-orphan.py",
+    )
+    sys.modules["vllm.parser.deepseek_v32"] = v32
 
 
 def _load_overlay(name: str, path: Path):
@@ -310,6 +315,7 @@ from vllm.parser.deepseek_v4 import (  # noqa: E402
     DSML_TOOL_START,
     deepseek_v4_config,
 )
+from vllm.parser.deepseek_v32 import deepseek_v32_config  # noqa: E402
 from vllm.parser.engine.parser_engine_config import ParserState  # noqa: E402
 from vllm.parser.engine.streaming_parser_engine import (  # noqa: E402
     StreamingParserEngine,
@@ -369,18 +375,20 @@ def _tool_names(events: list[SemanticEvent]) -> list[str]:
 
 
 class ReasoningOrphanInvokeConfigTests(unittest.TestCase):
-    def test_reasoning_invoke_prefix_closes_reasoning_and_validates_name(self) -> None:
+    def test_reasoning_invoke_is_provisional_until_invoke_end(self) -> None:
         config = deepseek_v4_config(thinking=True)
         content = config.transitions[(ParserState.CONTENT, "INVOKE_PREFIX")]
         reasoning = config.transitions[(ParserState.REASONING, "INVOKE_PREFIX")]
-        self.assertTrue(content.validate_tool_name)
+        invoke_end = config.transitions[(ParserState.TOOL_ARGS, "INVOKE_END")]
+        self.assertTrue(content.provisional_tool_call)
         self.assertEqual(content.events, (EventType.TOOL_CALL_START,))
-        self.assertTrue(reasoning.validate_tool_name)
+        self.assertTrue(reasoning.provisional_tool_call)
         self.assertEqual(
             reasoning.events,
             (EventType.REASONING_END, EventType.TOOL_CALL_START),
         )
         self.assertEqual(reasoning.next_state, ParserState.TOOL_NAME)
+        self.assertTrue(invoke_end.commit_provisional_tool_call)
 
 
 class ReasoningOrphanInvokeTests(unittest.TestCase):
@@ -465,10 +473,10 @@ class ReasoningOrphanInvokeTests(unittest.TestCase):
         events.extend(engine.feed("I will edit after checking.\n", []))
         events.extend(engine.feed(DSML_INVOKE_PREFIX, []))
         self.assertFalse(any(event.type == EventType.TOOL_CALL_START for event in events))
-        self.assertTrue(engine._hold_active)
+        self.assertTrue(engine._recovery_hold_active)
 
         events.extend(engine.feed("zzz", []))
-        self.assertFalse(engine._hold_active)
+        self.assertFalse(engine._recovery_hold_active)
         self.assertNotIn(EventType.TOOL_CALL_START, _event_types(events))
         self.assertEqual(engine.state, ParserState.REASONING)
         self.assertIn(
@@ -491,9 +499,115 @@ class ReasoningOrphanInvokeTests(unittest.TestCase):
         self.assertIn(EventType.TOOL_CALL_START, _event_types(events))
         self.assertEqual(_tool_names(events), ["apply_patch"])
 
+    def test_name_only_candidate_rolls_back_instead_of_calling_empty_tool(self) -> None:
+        engine = _make_engine()
+        raw = DSML_INVOKE_PREFIX + "apply_patch" + DSML_INVOKE_NAME_END
 
-class OverlayDoesNotLoosenNameValidationTests(unittest.TestCase):
-    def test_overlay_keeps_validate_tool_name_on_both_recovery_edges(self) -> None:
+        events = engine.parse_complete("Checking first.\n" + raw)
+
+        self.assertNotIn(EventType.TOOL_CALL_START, _event_types(events))
+        self.assertEqual(_tool_names(events), [])
+        reasoning = _joined(events, EventType.REASONING_CHUNK)
+        self.assertIn("Checking first.", reasoning)
+        self.assertIn(raw, reasoning)
+
+    def test_wrong_closer_rolls_back_complete_candidate(self) -> None:
+        engine = _make_engine()
+        raw = (
+            DSML_INVOKE_PREFIX
+            + "apply_patch"
+            + DSML_INVOKE_NAME_END
+            + _param("input", "true", "patch")
+            + DSML_TOOL_END
+        )
+
+        events = engine.parse_complete(raw)
+
+        self.assertNotIn(EventType.TOOL_CALL_START, _event_types(events))
+        self.assertIn(raw, _joined(events, EventType.REASONING_CHUNK))
+
+    def test_each_bare_invoke_is_independently_validated(self) -> None:
+        engine = _make_engine()
+        good = _invoke("apply_patch", ("input", "true", "patch"))
+        bad = _invoke("dangerous_tool", ("input", "true", "nope"))
+
+        events = engine.parse_complete(good + "\n" + bad)
+
+        self.assertEqual(_tool_names(events), ["apply_patch"])
+        self.assertEqual(_event_types(events).count(EventType.TOOL_CALL_START), 1)
+        self.assertIn(bad, _joined(events, EventType.TEXT_CHUNK))
+
+    def test_two_declared_bare_invokes_both_recover(self) -> None:
+        engine = _make_engine(
+            allowed=frozenset({"apply_patch", "read_file"})
+        )
+        first = _invoke("apply_patch", ("input", "true", "patch"))
+        second = _invoke("read_file", ("path", "true", "README.md"))
+
+        events = engine.parse_complete(first + "\n" + second)
+
+        self.assertEqual(_tool_names(events), ["apply_patch", "read_file"])
+        self.assertEqual(_event_types(events).count(EventType.TOOL_CALL_START), 2)
+
+    def test_suffix_after_recovered_invoke_is_content(self) -> None:
+        engine = _make_engine(thinking=False)
+        invoke = _invoke("apply_patch", ("input", "true", "patch"))
+
+        events = engine.parse_complete(invoke + "\nDone.")
+
+        self.assertEqual(_tool_names(events), ["apply_patch"])
+        self.assertIn("Done.", _joined(events, EventType.TEXT_CHUNK))
+
+    def test_optional_outer_closer_after_recovered_invoke_is_absorbed(self) -> None:
+        engine = _make_engine(thinking=False)
+        invoke = _invoke("apply_patch", ("input", "true", "patch"))
+
+        events = engine.parse_complete(invoke + DSML_TOOL_END)
+
+        self.assertEqual(_tool_names(events), ["apply_patch"])
+        self.assertNotIn(DSML_TOOL_END, _joined(events, EventType.TEXT_CHUNK))
+
+    def test_reasoning_adapter_promotes_only_a_complete_invoke(self) -> None:
+        engine = _make_engine()
+        engine.skip_tool_parsing = True
+        invoke = _invoke("apply_patch", ("input", "true", "patch"))
+
+        events = engine.parse_complete("Reasoning.\n" + invoke)
+
+        self.assertNotIn(EventType.TOOL_CALL_START, _event_types(events))
+        self.assertIn(EventType.REASONING_END, _event_types(events))
+        self.assertEqual(_joined(events, EventType.TEXT_CHUNK), invoke)
+        self.assertIn("Reasoning.", _joined(events, EventType.REASONING_CHUNK))
+
+    def test_reasoning_adapter_keeps_truncated_invoke_in_reasoning(self) -> None:
+        engine = _make_engine()
+        engine.skip_tool_parsing = True
+        raw = DSML_INVOKE_PREFIX + "apply_patch" + DSML_INVOKE_NAME_END
+
+        events = engine.parse_complete(raw)
+
+        self.assertNotIn(EventType.TOOL_CALL_START, _event_types(events))
+        self.assertEqual(_joined(events, EventType.TEXT_CHUNK), "")
+        self.assertIn(raw, _joined(events, EventType.REASONING_CHUNK))
+
+    def test_dropped_special_token_never_enters_recovery_buffer(self) -> None:
+        engine = _make_engine(thinking=False)
+        prefix = DSML_INVOKE_PREFIX + "apply_patch" + DSML_INVOKE_NAME_END
+        events = engine.feed(prefix + _param("input", "true", "patch"), [])
+        self.assertEqual(events, [])
+        self.assertTrue(engine._recovery_hold_active)
+
+        engine._has_drops = True
+        self.assertEqual(engine._on_terminal(DROP_TERMINAL, "<unused-special>"), [])
+        events.extend(engine.feed(DSML_INVOKE_END, []))
+        events.extend(engine.finish())
+
+        self.assertEqual(_tool_names(events), ["apply_patch"])
+        self.assertNotIn("<unused-special>", _joined(events, EventType.ARG_VALUE_CHUNK))
+
+
+class OverlayKeepsRecoveryProvisionalTests(unittest.TestCase):
+    def test_overlay_marks_both_recovery_edges_and_commit_boundary(self) -> None:
         source = (PATCHES / "parser-deepseek-v4.dsml-orphan.py").read_text()
         tree = ast.parse(source)
         config_fn = next(
@@ -501,19 +615,44 @@ class OverlayDoesNotLoosenNameValidationTests(unittest.TestCase):
             for node in tree.body
             if isinstance(node, ast.FunctionDef) and node.name == "deepseek_v4_config"
         )
-        validates: list[ast.keyword] = []
+        provisional: list[ast.keyword] = []
+        commits: list[ast.keyword] = []
 
         class _Visitor(ast.NodeVisitor):
             def visit_keyword(self, node: ast.keyword) -> None:
-                if node.arg == "validate_tool_name":
-                    validates.append(node)
+                if node.arg == "provisional_tool_call":
+                    provisional.append(node)
+                if node.arg == "commit_provisional_tool_call":
+                    commits.append(node)
                 self.generic_visit(node)
 
         _Visitor().visit(config_fn)
-        self.assertGreaterEqual(len(validates), 2)
-        for keyword in validates:
+        self.assertGreaterEqual(len(provisional), 2)
+        self.assertGreaterEqual(len(commits), 1)
+        for keyword in provisional + commits:
             self.assertIsInstance(keyword.value, ast.Constant)
             self.assertIs(keyword.value.value, True)
+
+
+class V32RecoveryCompatibilityTests(unittest.TestCase):
+    def test_v32_recovery_also_waits_for_complete_invoke(self) -> None:
+        engine = StreamingParserEngine(deepseek_v32_config(), tokenizer=None)
+        engine.allowed_tool_names = frozenset({"apply_patch"})
+        invoke = _invoke("apply_patch", ("input", "true", "patch"))
+
+        events = engine.parse_complete(invoke)
+
+        self.assertEqual(_tool_names(events), ["apply_patch"])
+
+    def test_v32_truncated_recovery_stays_content(self) -> None:
+        engine = StreamingParserEngine(deepseek_v32_config(), tokenizer=None)
+        engine.allowed_tool_names = frozenset({"apply_patch"})
+        raw = DSML_INVOKE_PREFIX + "apply_patch" + DSML_INVOKE_NAME_END
+
+        events = engine.parse_complete(raw)
+
+        self.assertNotIn(EventType.TOOL_CALL_START, _event_types(events))
+        self.assertEqual(_joined(events, EventType.TEXT_CHUNK), raw)
 
 
 if __name__ == "__main__":

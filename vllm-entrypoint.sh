@@ -10,5 +10,6 @@ fi
 python3 /opt/apply-deepseek-v4-reasoning-effort.py
 python3 /opt/apply-deepseek-v4-generation-prompt.py
 python3 /opt/apply-deepseek-v4-indexer-prefill-budget.py
+python3 /opt/apply-deepseek-v4-parser-recovery.py
 
 exec vllm serve "$@"

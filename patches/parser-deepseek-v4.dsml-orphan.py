@@ -177,22 +177,22 @@ def deepseek_v4_config(thinking: bool = False) -> ParserEngineConfig:
             ),
             # Orphan invoke: at long context the model may omit the
             # <｜DSML｜tool_calls> wrapper and emit the invoke directly.
-            # The invoke marker has no dedicated special token, so hold
-            # events and validate the parsed name before committing.
-            # Only names the request declared are accepted.
+            # The invoke marker has no dedicated special token, so keep the
+            # entire candidate provisional. Commit only after a declared
+            # name and the closing invoke marker have both been observed.
             (ParserState.CONTENT, "INVOKE_PREFIX"): Transition(
                 ParserState.TOOL_NAME,
                 (EventType.TOOL_CALL_START,),
-                validate_tool_name=True,
+                provisional_tool_call=True,
             ),
             # Same recovery from prompt-opened reasoning. Hard agent
             # turns often omit both </think> and the wrapper (vLLM
             # #49117 limitation 2). Close reasoning, then hold and
-            # validate the name the same way as CONTENT recovery.
+            # validate the complete invoke the same way as CONTENT recovery.
             (ParserState.REASONING, "INVOKE_PREFIX"): Transition(
                 ParserState.TOOL_NAME,
                 (EventType.REASONING_END, EventType.TOOL_CALL_START),
-                validate_tool_name=True,
+                provisional_tool_call=True,
             ),
             # V3.2-style function_calls wrapper is foreign to V4: pass
             # it and its contents through as plain content
@@ -222,6 +222,7 @@ def deepseek_v4_config(thinking: bool = False) -> ParserEngineConfig:
             (ParserState.TOOL_ARGS, "INVOKE_END"): Transition(
                 ParserState.TOOL_BETWEEN,
                 (EventType.TOOL_CALL_END,),
+                commit_provisional_tool_call=True,
             ),
             (ParserState.TOOL_ARGS, "TOOL_END"): Transition(
                 ParserState.CONTENT,
