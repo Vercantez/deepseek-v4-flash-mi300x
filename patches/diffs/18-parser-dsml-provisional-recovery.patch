@@ -1,3 +1,132 @@
+diff --git a/patches/apply-deepseek-v4-parser-recovery.py b/patches/apply-deepseek-v4-parser-recovery.py
+new file mode 100644
+index 0000000..a9393d5
+--- /dev/null
++++ b/patches/apply-deepseek-v4-parser-recovery.py
+@@ -0,0 +1,123 @@
++#!/usr/bin/env python3
++"""Synchronize request context into vLLM's engine-based reasoning adapter.
++
++The parser overlays recover a complete bare DSML invoke while the serving
++stack is still in its reasoning phase. The pinned vLLM adapters otherwise
++construct that reasoning parser without request tools and do not refresh its
++request state before every streaming delta. Patch only exact source blocks
++from vLLM 124154a88 and fail closed if the image changes.
++"""
++
++from __future__ import annotations
++
++import argparse
++from pathlib import Path
++
++
++ABSTRACT_PARSER_RELATIVE = Path("vllm/parser/abstract_parser.py")
++ADAPTERS_RELATIVE = Path("vllm/parser/engine/adapters.py")
++
++OLD_STREAMING_REASONING_ENTRY = '''        # Reasoning extraction
++        if self._in_reasoning_phase(state):
++            delta_message = self.extract_reasoning_streaming(
++'''
++
++NEW_STREAMING_REASONING_ENTRY = '''        # Reasoning extraction
++        if self._in_reasoning_phase(state):
++            reasoning_parser = self._reasoning_parser
++            if reasoning_parser is not None and reasoning_parser.engine_based_streaming:
++                reasoning_parser.adjust_request(request)
++            delta_message = self.extract_reasoning_streaming(
++'''
++
++OLD_DUPLICATE_REASONING_PARSER = '''            )
++            reasoning_parser = self._reasoning_parser
++            if reasoning_parser is not None and reasoning_parser.engine_based_streaming:
++'''
++
++NEW_DUPLICATE_REASONING_PARSER = '''            )
++            if reasoning_parser is not None and reasoning_parser.engine_based_streaming:
++'''
++
++OLD_NONSTREAMING_REASONING_ENTRY = '''    ) -> tuple[str | None, str | None]:
++        with self._skip_tool_parsing():
++            return self._parser_engine.extract_reasoning(model_output, request)
++'''
++
++NEW_NONSTREAMING_REASONING_ENTRY = '''    ) -> tuple[str | None, str | None]:
++        self.adjust_request(request)
++        with self._skip_tool_parsing():
++            return self._parser_engine.extract_reasoning(model_output, request)
++'''
++
++OLD_REASONING_ADJUST_REQUEST = '''    def adjust_request(
++        self,
++        request: ChatCompletionRequest | ResponsesRequest,
++    ) -> ChatCompletionRequest | ResponsesRequest:
++        return self._parser_engine.adjust_request(request)
++
++    def has_engine_confirmed_reasoning_end(self) -> bool:
++'''
++
++NEW_REASONING_ADJUST_REQUEST = '''    def adjust_request(
++        self,
++        request: ChatCompletionRequest | ResponsesRequest,
++    ) -> ChatCompletionRequest | ResponsesRequest:
++        request = self._parser_engine.adjust_request(request)
++        with self._skip_tool_parsing():
++            self._parser_engine._check_skip_tool_parsing(request)
++        return request
++
++    def has_engine_confirmed_reasoning_end(self) -> bool:
++'''
++
++
++def replace_once(source: str, old: str, new: str, path: Path) -> str:
++    if new in source:
++        return source
++    count = source.count(old)
++    if count != 1:
++        raise RuntimeError(
++            f"Expected one pinned source block in {path}, found {count}; "
++            "refusing to patch an unknown vLLM version"
++        )
++    return source.replace(old, new, 1)
++
++
++def apply_parser_recovery_patch(package_root: Path) -> None:
++    abstract_path = package_root / ABSTRACT_PARSER_RELATIVE
++    adapters_path = package_root / ADAPTERS_RELATIVE
++
++    abstract_source = abstract_path.read_text()
++    for old, new in (
++        (OLD_STREAMING_REASONING_ENTRY, NEW_STREAMING_REASONING_ENTRY),
++        (OLD_DUPLICATE_REASONING_PARSER, NEW_DUPLICATE_REASONING_PARSER),
++    ):
++        abstract_source = replace_once(abstract_source, old, new, abstract_path)
++    adapters_source = adapters_path.read_text()
++    for old, new in (
++        (OLD_NONSTREAMING_REASONING_ENTRY, NEW_NONSTREAMING_REASONING_ENTRY),
++        (OLD_REASONING_ADJUST_REQUEST, NEW_REASONING_ADJUST_REQUEST),
++    ):
++        adapters_source = replace_once(adapters_source, old, new, adapters_path)
++
++    # Validate all changes before touching either installed module.
++    compile(abstract_source, str(abstract_path), "exec")
++    compile(adapters_source, str(adapters_path), "exec")
++    abstract_path.write_text(abstract_source)
++    adapters_path.write_text(adapters_source)
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser()
++    parser.add_argument(
++        "--package-root",
++        type=Path,
++        default=Path("/usr/local/lib/python3.12/dist-packages"),
++    )
++    args = parser.parse_args()
++    apply_parser_recovery_patch(args.package_root)
++
++
++if __name__ == "__main__":
++    main()
 diff --git a/patches/parser-deepseek-v32.dsml-orphan.py b/patches/parser-deepseek-v32.dsml-orphan.py
 index 30768d6..af4fbaa 100644
 --- a/patches/parser-deepseek-v32.dsml-orphan.py
@@ -29,10 +158,10 @@ index 30768d6..af4fbaa 100644
              (ParserState.TOOL_ARGS, "TOOL_END"): Transition(
                  ParserState.CONTENT,
 diff --git a/patches/parser-deepseek-v4.dsml-orphan.py b/patches/parser-deepseek-v4.dsml-orphan.py
-index 5878025..373cf0f 100644
+index 5878025..82ae0a4 100644
 --- a/patches/parser-deepseek-v4.dsml-orphan.py
 +++ b/patches/parser-deepseek-v4.dsml-orphan.py
-@@ -177,22 +177,22 @@ def deepseek_v4_config(thinking: bool = False) -> ParserEngineConfig:
+@@ -177,22 +177,39 @@ def deepseek_v4_config(thinking: bool = False) -> ParserEngineConfig:
              ),
              # Orphan invoke: at long context the model may omit the
              # <｜DSML｜tool_calls> wrapper and emit the invoke directly.
@@ -58,10 +187,27 @@ index 5878025..373cf0f 100644
                  (EventType.REASONING_END, EventType.TOOL_CALL_START),
 -                validate_tool_name=True,
 +                provisional_tool_call=True,
++            ),
++            # V3.2's wrapper is foreign in reasoning too. Preserve the whole
++            # block as reasoning so a declared invoke quoted inside it cannot
++            # cross the implicit recovery edge and execute.
++            (ParserState.REASONING, "FOREIGN_START"): Transition(
++                ParserState.FOREIGN_REASONING_BLOCK,
++                (EventType.REASONING_CHUNK,),
++            ),
++            (ParserState.FOREIGN_REASONING_BLOCK, "FOREIGN_END"): Transition(
++                ParserState.REASONING,
++                (EventType.REASONING_CHUNK,),
++            ),
++            # As in CONTENT, an actual native V4 wrapper wins over an
++            # unclosed foreign block.
++            (ParserState.FOREIGN_REASONING_BLOCK, "TOOL_START"): Transition(
++                ParserState.TOOL_PREAMBLE,
++                (EventType.REASONING_END,),
              ),
              # V3.2-style function_calls wrapper is foreign to V4: pass
              # it and its contents through as plain content
-@@ -222,6 +222,7 @@ def deepseek_v4_config(thinking: bool = False) -> ParserEngineConfig:
+@@ -222,6 +239,7 @@ def deepseek_v4_config(thinking: bool = False) -> ParserEngineConfig:
              (ParserState.TOOL_ARGS, "INVOKE_END"): Transition(
                  ParserState.TOOL_BETWEEN,
                  (EventType.TOOL_CALL_END,),
@@ -69,11 +215,30 @@ index 5878025..373cf0f 100644
              ),
              (ParserState.TOOL_ARGS, "TOOL_END"): Transition(
                  ParserState.CONTENT,
+@@ -243,6 +261,7 @@ def deepseek_v4_config(thinking: bool = False) -> ParserEngineConfig:
+             ParserState.TOOL_NAME: EventType.TOOL_NAME,
+             ParserState.TOOL_ARGS: EventType.ARG_VALUE_CHUNK,
+             ParserState.FOREIGN_BLOCK: EventType.TEXT_CHUNK,
++            ParserState.FOREIGN_REASONING_BLOCK: EventType.REASONING_CHUNK,
+         },
+         arg_converter=_dsml_arg_converter,
+         arg_structural_chars=frozenset(">"),
 diff --git a/patches/parser-engine-config.dsml-orphan.py b/patches/parser-engine-config.dsml-orphan.py
-index 1962567..422f642 100644
+index 1962567..6d1c297 100644
 --- a/patches/parser-engine-config.dsml-orphan.py
 +++ b/patches/parser-engine-config.dsml-orphan.py
-@@ -43,11 +43,14 @@ class Transition:
+@@ -36,6 +36,10 @@ class ParserState(Enum):
+     # Inside a block belonging to a different model format; terminals
+     # matched here pass through as plain content.
+     FOREIGN_BLOCK = auto()
++    # Same as FOREIGN_BLOCK while reasoning is still open. Keeping this state
++    # distinct prevents foreign/quoted invokes from ending reasoning or being
++    # recovered as executable tools.
++    FOREIGN_REASONING_BLOCK = auto()
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+@@ -43,11 +47,14 @@ class Transition:
      next_state: ParserState
      events: tuple[EventType, ...] = field(default_factory=tuple)
      skip_in_token_id_mode: bool = False
@@ -94,7 +259,7 @@ index 1962567..422f642 100644
  
  @dataclass(frozen=True)
 diff --git a/patches/parser-engine.dsml-orphan.py b/patches/parser-engine.dsml-orphan.py
-index 1e3f7ed..f0c0f4b 100644
+index 1e3f7ed..80f6e3b 100644
 --- a/patches/parser-engine.dsml-orphan.py
 +++ b/patches/parser-engine.dsml-orphan.py
 @@ -421,11 +421,12 @@ class ParserEngine(Parser):
@@ -114,8 +279,41 @@ index 1e3f7ed..f0c0f4b 100644
          # The engine needs the suppression state too: recovery
          # transitions must not consume text that will never be allowed
          # to become a tool call.
+@@ -738,6 +739,12 @@ class ParserEngine(Parser):
+         content_parts: list[str] = []
+         reasoning_parts: list[str] = []
+ 
++        # Content deferred by an earlier conversion belongs before every
++        # event in this batch. Keep it separate from text encountered after
++        # a tool event below, which belongs at the end of this batch.
++        deferred_before = self._deferred_content
++        self._deferred_content = ""
++
+         seen_tool_event = False
+         suppress = self._suppress_tool_calls
+         for event in events:
+@@ -773,8 +780,17 @@ class ParserEngine(Parser):
+         if len(tool_call_deltas) > 1:
+             tool_call_deltas = self._coalesce_tool_call_deltas(tool_call_deltas)
+ 
+-        if self._deferred_content and (not seen_tool_event or not tool_call_deltas):
+-            content_parts.insert(0, self._deferred_content)
++        if deferred_before:
++            content_parts.insert(0, deferred_before)
++
++        # Text after a tool event is held until the tool delta is complete so
++        # streaming chunks stay ordered. A finished batch has no later call
++        # that could flush it, so append the deferred suffix now. This is also
++        # the only conversion performed by non-streaming parsing.
++        if self._deferred_content and (
++            finished or not seen_tool_event or not tool_call_deltas
++        ):
++            content_parts.append(self._deferred_content)
+             self._deferred_content = ""
+ 
+         content_str = "".join(content_parts)
 diff --git a/patches/streaming-parser-engine.dsml-orphan.py b/patches/streaming-parser-engine.dsml-orphan.py
-index dbccb73..ea91147 100644
+index dbccb73..acf2fcf 100644
 --- a/patches/streaming-parser-engine.dsml-orphan.py
 +++ b/patches/streaming-parser-engine.dsml-orphan.py
 @@ -156,10 +156,15 @@ class StreamingParserEngine:
@@ -173,7 +371,19 @@ index dbccb73..ea91147 100644
  
          if self._args_buffer:
              events.append(
-@@ -335,23 +338,43 @@ class StreamingParserEngine:
+@@ -290,7 +293,10 @@ class StreamingParserEngine:
+                     )
+                 )
+             self.state = ParserState.CONTENT
+-        elif self.state == ParserState.REASONING:
++        elif self.state in (
++            ParserState.REASONING,
++            ParserState.FOREIGN_REASONING_BLOCK,
++        ):
+             events.append(
+                 SemanticEvent(EventType.REASONING_END, tool_index=self.tool_index)
+             )
+@@ -335,23 +341,43 @@ class StreamingParserEngine:
      )
  
      def _on_terminal(self, terminal: str, value: str) -> list[SemanticEvent]:
@@ -224,7 +434,7 @@ index dbccb73..ea91147 100644
          if self.skip_tool_parsing and terminal in self._tool_terminals:
              if self.state == ParserState.MESSAGE_HEADER:
                  self.state = ParserState.CONTENT
-@@ -390,23 +413,11 @@ class StreamingParserEngine:
+@@ -390,23 +416,11 @@ class StreamingParserEngine:
          return self._apply_transition(transition, value)
  
      def _emit_for_state(self, text: str) -> list[SemanticEvent]:
@@ -253,7 +463,7 @@ index dbccb73..ea91147 100644
          if self.state == ParserState.MESSAGE_HEADER:
              self._message_header_buffer += text
              return []
-@@ -423,24 +434,26 @@ class StreamingParserEngine:
+@@ -423,24 +437,26 @@ class StreamingParserEngine:
          content_type = self.config.content_events.get(self.state)
          if content_type is not None:
              return [SemanticEvent(content_type, value=text, tool_index=self.tool_index)]
@@ -298,7 +508,7 @@ index dbccb73..ea91147 100644
          return []
  
      def _on_content(self, text: str) -> list[SemanticEvent]:
-@@ -453,76 +466,118 @@ class StreamingParserEngine:
+@@ -453,76 +469,118 @@ class StreamingParserEngine:
          transition: Transition,
          value: str,
      ) -> list[SemanticEvent]:
@@ -463,7 +673,7 @@ index dbccb73..ea91147 100644
          """
          allowed = self.allowed_tool_names
          if allowed is None:
-@@ -552,17 +607,10 @@ class StreamingParserEngine:
+@@ -552,17 +610,10 @@ class StreamingParserEngine:
              )
              self._args_buffer = ""
  
@@ -481,132 +691,3 @@ index dbccb73..ea91147 100644
          self.state = transition.next_state
  
          for event_type in transition.events:
-diff --git a/patches/apply-deepseek-v4-parser-recovery.py b/patches/apply-deepseek-v4-parser-recovery.py
-new file mode 100644
-index 0000000..a9393d5
---- /dev/null
-+++ b/patches/apply-deepseek-v4-parser-recovery.py
-@@ -0,0 +1,123 @@
-+#!/usr/bin/env python3
-+"""Synchronize request context into vLLM's engine-based reasoning adapter.
-+
-+The parser overlays recover a complete bare DSML invoke while the serving
-+stack is still in its reasoning phase. The pinned vLLM adapters otherwise
-+construct that reasoning parser without request tools and do not refresh its
-+request state before every streaming delta. Patch only exact source blocks
-+from vLLM 124154a88 and fail closed if the image changes.
-+"""
-+
-+from __future__ import annotations
-+
-+import argparse
-+from pathlib import Path
-+
-+
-+ABSTRACT_PARSER_RELATIVE = Path("vllm/parser/abstract_parser.py")
-+ADAPTERS_RELATIVE = Path("vllm/parser/engine/adapters.py")
-+
-+OLD_STREAMING_REASONING_ENTRY = '''        # Reasoning extraction
-+        if self._in_reasoning_phase(state):
-+            delta_message = self.extract_reasoning_streaming(
-+'''
-+
-+NEW_STREAMING_REASONING_ENTRY = '''        # Reasoning extraction
-+        if self._in_reasoning_phase(state):
-+            reasoning_parser = self._reasoning_parser
-+            if reasoning_parser is not None and reasoning_parser.engine_based_streaming:
-+                reasoning_parser.adjust_request(request)
-+            delta_message = self.extract_reasoning_streaming(
-+'''
-+
-+OLD_DUPLICATE_REASONING_PARSER = '''            )
-+            reasoning_parser = self._reasoning_parser
-+            if reasoning_parser is not None and reasoning_parser.engine_based_streaming:
-+'''
-+
-+NEW_DUPLICATE_REASONING_PARSER = '''            )
-+            if reasoning_parser is not None and reasoning_parser.engine_based_streaming:
-+'''
-+
-+OLD_NONSTREAMING_REASONING_ENTRY = '''    ) -> tuple[str | None, str | None]:
-+        with self._skip_tool_parsing():
-+            return self._parser_engine.extract_reasoning(model_output, request)
-+'''
-+
-+NEW_NONSTREAMING_REASONING_ENTRY = '''    ) -> tuple[str | None, str | None]:
-+        self.adjust_request(request)
-+        with self._skip_tool_parsing():
-+            return self._parser_engine.extract_reasoning(model_output, request)
-+'''
-+
-+OLD_REASONING_ADJUST_REQUEST = '''    def adjust_request(
-+        self,
-+        request: ChatCompletionRequest | ResponsesRequest,
-+    ) -> ChatCompletionRequest | ResponsesRequest:
-+        return self._parser_engine.adjust_request(request)
-+
-+    def has_engine_confirmed_reasoning_end(self) -> bool:
-+'''
-+
-+NEW_REASONING_ADJUST_REQUEST = '''    def adjust_request(
-+        self,
-+        request: ChatCompletionRequest | ResponsesRequest,
-+    ) -> ChatCompletionRequest | ResponsesRequest:
-+        request = self._parser_engine.adjust_request(request)
-+        with self._skip_tool_parsing():
-+            self._parser_engine._check_skip_tool_parsing(request)
-+        return request
-+
-+    def has_engine_confirmed_reasoning_end(self) -> bool:
-+'''
-+
-+
-+def replace_once(source: str, old: str, new: str, path: Path) -> str:
-+    if new in source:
-+        return source
-+    count = source.count(old)
-+    if count != 1:
-+        raise RuntimeError(
-+            f"Expected one pinned source block in {path}, found {count}; "
-+            "refusing to patch an unknown vLLM version"
-+        )
-+    return source.replace(old, new, 1)
-+
-+
-+def apply_parser_recovery_patch(package_root: Path) -> None:
-+    abstract_path = package_root / ABSTRACT_PARSER_RELATIVE
-+    adapters_path = package_root / ADAPTERS_RELATIVE
-+
-+    abstract_source = abstract_path.read_text()
-+    for old, new in (
-+        (OLD_STREAMING_REASONING_ENTRY, NEW_STREAMING_REASONING_ENTRY),
-+        (OLD_DUPLICATE_REASONING_PARSER, NEW_DUPLICATE_REASONING_PARSER),
-+    ):
-+        abstract_source = replace_once(abstract_source, old, new, abstract_path)
-+    adapters_source = adapters_path.read_text()
-+    for old, new in (
-+        (OLD_NONSTREAMING_REASONING_ENTRY, NEW_NONSTREAMING_REASONING_ENTRY),
-+        (OLD_REASONING_ADJUST_REQUEST, NEW_REASONING_ADJUST_REQUEST),
-+    ):
-+        adapters_source = replace_once(adapters_source, old, new, adapters_path)
-+
-+    # Validate all changes before touching either installed module.
-+    compile(abstract_source, str(abstract_path), "exec")
-+    compile(adapters_source, str(adapters_path), "exec")
-+    abstract_path.write_text(abstract_source)
-+    adapters_path.write_text(adapters_source)
-+
-+
-+def main() -> None:
-+    parser = argparse.ArgumentParser()
-+    parser.add_argument(
-+        "--package-root",
-+        type=Path,
-+        default=Path("/usr/local/lib/python3.12/dist-packages"),
-+    )
-+    args = parser.parse_args()
-+    apply_parser_recovery_patch(args.package_root)
-+
-+
-+if __name__ == "__main__":
-+    main()

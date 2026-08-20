@@ -74,6 +74,21 @@ through the separately configured reasoning adapter. The design follows the
 reviewed hardening in vLLM PR #52645 while remaining compatible with the pinned
 `124154a88` runtime.
 
+The source transformer is checked against repository-owned snapshots of the
+exact pinned modules by the normal unit suite. Before deploying parser changes,
+also run the serving-layer smoke in the pinned image (it does not load model
+weights or require a GPU):
+
+```bash
+tests/run_exact_image_parser_recovery.sh
+```
+
+One accounting limitation remains: when recovery closes implicit reasoning at
+a bare invoke without a generated `</think>`, total and output token counts are
+correct but the optional `reasoning_tokens` detail can under-report that span.
+Fixing that safely requires semantic token-position plumbing rather than
+guessing from the first invoke-like token sequence.
+
 `diffs/16-aiter-pa-mqa-block256-i64.patch` is incremental against the previous
 AITER overlay. It converts the alternate non-variable-context preshuffle
 pipeline selected by production's `ChunkK=256`, `KVBlockSize=256` combination;

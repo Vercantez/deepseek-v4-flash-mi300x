@@ -194,6 +194,23 @@ def deepseek_v4_config(thinking: bool = False) -> ParserEngineConfig:
                 (EventType.REASONING_END, EventType.TOOL_CALL_START),
                 provisional_tool_call=True,
             ),
+            # V3.2's wrapper is foreign in reasoning too. Preserve the whole
+            # block as reasoning so a declared invoke quoted inside it cannot
+            # cross the implicit recovery edge and execute.
+            (ParserState.REASONING, "FOREIGN_START"): Transition(
+                ParserState.FOREIGN_REASONING_BLOCK,
+                (EventType.REASONING_CHUNK,),
+            ),
+            (ParserState.FOREIGN_REASONING_BLOCK, "FOREIGN_END"): Transition(
+                ParserState.REASONING,
+                (EventType.REASONING_CHUNK,),
+            ),
+            # As in CONTENT, an actual native V4 wrapper wins over an
+            # unclosed foreign block.
+            (ParserState.FOREIGN_REASONING_BLOCK, "TOOL_START"): Transition(
+                ParserState.TOOL_PREAMBLE,
+                (EventType.REASONING_END,),
+            ),
             # V3.2-style function_calls wrapper is foreign to V4: pass
             # it and its contents through as plain content
             (ParserState.CONTENT, "FOREIGN_START"): Transition(
@@ -244,6 +261,7 @@ def deepseek_v4_config(thinking: bool = False) -> ParserEngineConfig:
             ParserState.TOOL_NAME: EventType.TOOL_NAME,
             ParserState.TOOL_ARGS: EventType.ARG_VALUE_CHUNK,
             ParserState.FOREIGN_BLOCK: EventType.TEXT_CHUNK,
+            ParserState.FOREIGN_REASONING_BLOCK: EventType.REASONING_CHUNK,
         },
         arg_converter=_dsml_arg_converter,
         arg_structural_chars=frozenset(">"),

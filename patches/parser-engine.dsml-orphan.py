@@ -739,6 +739,12 @@ class ParserEngine(Parser):
         content_parts: list[str] = []
         reasoning_parts: list[str] = []
 
+        # Content deferred by an earlier conversion belongs before every
+        # event in this batch. Keep it separate from text encountered after
+        # a tool event below, which belongs at the end of this batch.
+        deferred_before = self._deferred_content
+        self._deferred_content = ""
+
         seen_tool_event = False
         suppress = self._suppress_tool_calls
         for event in events:
@@ -774,8 +780,17 @@ class ParserEngine(Parser):
         if len(tool_call_deltas) > 1:
             tool_call_deltas = self._coalesce_tool_call_deltas(tool_call_deltas)
 
-        if self._deferred_content and (not seen_tool_event or not tool_call_deltas):
-            content_parts.insert(0, self._deferred_content)
+        if deferred_before:
+            content_parts.insert(0, deferred_before)
+
+        # Text after a tool event is held until the tool delta is complete so
+        # streaming chunks stay ordered. A finished batch has no later call
+        # that could flush it, so append the deferred suffix now. This is also
+        # the only conversion performed by non-streaming parsing.
+        if self._deferred_content and (
+            finished or not seen_tool_event or not tool_call_deltas
+        ):
+            content_parts.append(self._deferred_content)
             self._deferred_content = ""
 
         content_str = "".join(content_parts)

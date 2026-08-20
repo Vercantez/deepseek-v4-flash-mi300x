@@ -276,7 +276,22 @@ def _install_parser_stubs() -> None:
     sys.modules["vllm.parser.engine.streaming_parser_engine"] = engine_mod
 
     parser_engine = types.ModuleType("vllm.parser.engine.parser_engine")
-    parser_engine.ParserEngine = object
+
+    class ParserEngineStub:
+        def __init__(
+            self,
+            tokenizer,
+            tools=None,
+            *,
+            parser_engine_config,
+            **kwargs,
+        ) -> None:
+            self.model_tokenizer = tokenizer
+            self._tools = tools
+            self._tool_slots = []
+            self.parser_engine_config = parser_engine_config
+
+    parser_engine.ParserEngine = ParserEngineStub
     sys.modules["vllm.parser.engine.parser_engine"] = parser_engine
 
     utils = types.ModuleType("vllm.tool_parsers.utils")
@@ -310,9 +325,12 @@ from vllm.parser.deepseek_v4 import (  # noqa: E402
     DSML_INVOKE_END,
     DSML_INVOKE_NAME_END,
     DSML_INVOKE_PREFIX,
+    DSML_FOREIGN_TOOL_END,
+    DSML_FOREIGN_TOOL_START,
     DSML_THINK_END,
     DSML_TOOL_END,
     DSML_TOOL_START,
+    DeepSeekV4Parser,
     deepseek_v4_config,
 )
 from vllm.parser.deepseek_v32 import deepseek_v32_config  # noqa: E402
@@ -375,6 +393,31 @@ def _tool_names(events: list[SemanticEvent]) -> list[str]:
 
 
 class ReasoningOrphanInvokeConfigTests(unittest.TestCase):
+    def test_parser_defaults_to_chat_like_the_pinned_tokenizer(self) -> None:
+        parser = DeepSeekV4Parser(tokenizer=None)
+        self.assertEqual(parser.parser_engine_config.initial_state, ParserState.CONTENT)
+
+    def test_parser_honors_explicit_thinking_disable(self) -> None:
+        parser = DeepSeekV4Parser(
+            tokenizer=None,
+            chat_template_kwargs={"thinking": False},
+        )
+        self.assertEqual(parser.parser_engine_config.initial_state, ParserState.CONTENT)
+
+    def test_explicit_thinking_starts_in_reasoning(self) -> None:
+        parser = DeepSeekV4Parser(
+            tokenizer=None,
+            chat_template_kwargs={"thinking": True},
+        )
+        self.assertEqual(parser.parser_engine_config.initial_state, ParserState.REASONING)
+
+    def test_reasoning_effort_none_disables_explicit_thinking(self) -> None:
+        parser = DeepSeekV4Parser(
+            tokenizer=None,
+            chat_template_kwargs={"thinking": True, "reasoning_effort": "none"},
+        )
+        self.assertEqual(parser.parser_engine_config.initial_state, ParserState.CONTENT)
+
     def test_reasoning_invoke_is_provisional_until_invoke_end(self) -> None:
         config = deepseek_v4_config(thinking=True)
         content = config.transitions[(ParserState.CONTENT, "INVOKE_PREFIX")]
@@ -436,6 +479,38 @@ class ReasoningOrphanInvokeTests(unittest.TestCase):
         self.assertEqual(_tool_names(events), ["apply_patch"])
         self.assertIn(reasoning.strip(), _joined(events, EventType.REASONING_CHUNK).strip())
         self.assertNotIn(DSML_TOOL_START, _joined(events, EventType.REASONING_CHUNK))
+
+    def test_foreign_wrapper_in_reasoning_cannot_execute_inner_invoke(self) -> None:
+        engine = _make_engine()
+        invoke = _invoke("apply_patch", ("input", "true", "patch"))
+        foreign = DSML_FOREIGN_TOOL_START + invoke + DSML_FOREIGN_TOOL_END
+
+        events = engine.parse_complete("Considering quoted output.\n" + foreign)
+
+        self.assertNotIn(EventType.TOOL_CALL_START, _event_types(events))
+        self.assertEqual(_tool_names(events), [])
+        reasoning = _joined(events, EventType.REASONING_CHUNK)
+        self.assertIn(foreign, reasoning)
+
+    def test_native_wrapper_escapes_unclosed_foreign_reasoning_block(self) -> None:
+        engine = _make_engine()
+        wrapped = _wrapped(_invoke("apply_patch", ("input", "true", "patch")))
+
+        events = engine.parse_complete(DSML_FOREIGN_TOOL_START + wrapped)
+
+        self.assertIn(EventType.REASONING_END, _event_types(events))
+        self.assertEqual(_tool_names(events), ["apply_patch"])
+
+    def test_unclosed_foreign_wrapper_finishes_as_reasoning(self) -> None:
+        engine = _make_engine()
+        foreign = DSML_FOREIGN_TOOL_START + "quoted output"
+
+        events = engine.parse_complete(foreign)
+
+        self.assertNotIn(EventType.TOOL_CALL_START, _event_types(events))
+        self.assertEqual(_joined(events, EventType.REASONING_CHUNK), foreign)
+        self.assertEqual(_event_types(events).count(EventType.REASONING_END), 1)
+        self.assertEqual(engine.state, ParserState.CONTENT)
 
     def test_think_end_then_orphan_invoke_uses_content_recovery(self) -> None:
         engine = _make_engine()

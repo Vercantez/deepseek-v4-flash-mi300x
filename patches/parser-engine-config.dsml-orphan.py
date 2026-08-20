@@ -36,6 +36,10 @@ class ParserState(Enum):
     # Inside a block belonging to a different model format; terminals
     # matched here pass through as plain content.
     FOREIGN_BLOCK = auto()
+    # Same as FOREIGN_BLOCK while reasoning is still open. Keeping this state
+    # distinct prevents foreign/quoted invokes from ending reasoning or being
+    # recovered as executable tools.
+    FOREIGN_REASONING_BLOCK = auto()
 
 
 @dataclass(frozen=True, slots=True)

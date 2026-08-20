@@ -1,3 +1,4 @@
+import hashlib
 import importlib.util
 import tempfile
 import unittest
@@ -13,6 +14,16 @@ SPEC = importlib.util.spec_from_file_location("parser_recovery_patch", MODULE_PA
 assert SPEC is not None and SPEC.loader is not None
 parser_recovery_patch = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(parser_recovery_patch)
+
+FIXTURE_ROOT = Path(__file__).parent / "fixtures" / "vllm-124154a88"
+PINNED_FIXTURES = {
+    parser_recovery_patch.ABSTRACT_PARSER_RELATIVE: (
+        "87a1b225e95fcdc1dc20a0103647c8b49cfeca0ced2a942ea41447e628aa59a1"
+    ),
+    parser_recovery_patch.ADAPTERS_RELATIVE: (
+        "dc1c1317dbfb298e54b8d94ca0e66d2b0cb1e481c35cdcc60a815284bd8a6ef7"
+    ),
+}
 
 
 class ParserRecoveryPatchTests(unittest.TestCase):
@@ -67,10 +78,19 @@ class ParserRecoveryPatchTests(unittest.TestCase):
             )
 
     def test_applies_to_exact_pinned_sources(self) -> None:
-        pinned_abstract = Path("/tmp/abstract_parser.py.124154")
-        pinned_adapters = Path("/tmp/adapters.py.124154")
-        if not pinned_abstract.exists() or not pinned_adapters.exists():
-            self.skipTest("pinned vLLM sources are not present")
+        pinned_abstract = (
+            FIXTURE_ROOT / parser_recovery_patch.ABSTRACT_PARSER_RELATIVE
+        )
+        pinned_adapters = FIXTURE_ROOT / parser_recovery_patch.ADAPTERS_RELATIVE
+
+        for relative_path, expected_sha256 in PINNED_FIXTURES.items():
+            source = FIXTURE_ROOT / relative_path
+            self.assertTrue(source.is_file(), f"missing pinned fixture: {source}")
+            self.assertEqual(
+                hashlib.sha256(source.read_bytes()).hexdigest(),
+                expected_sha256,
+                f"pinned fixture changed unexpectedly: {source}",
+            )
 
         with tempfile.TemporaryDirectory() as tempdir:
             package_root = Path(tempdir)
