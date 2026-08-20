@@ -1,0 +1,18 @@
+--- a/patches/parser-deepseek-v4.dsml-orphan.py
++++ b/patches/parser-deepseek-v4.dsml-orphan.py
+@@ -185,6 +185,15 @@
+                 (EventType.TOOL_CALL_START,),
+                 validate_tool_name=True,
+             ),
++            # Same recovery from prompt-opened reasoning. Hard agent
++            # turns often omit both </think> and the wrapper (vLLM
++            # #49117 limitation 2). Close reasoning, then hold and
++            # validate the name the same way as CONTENT recovery.
++            (ParserState.REASONING, "INVOKE_PREFIX"): Transition(
++                ParserState.TOOL_NAME,
++                (EventType.REASONING_END, EventType.TOOL_CALL_START),
++                validate_tool_name=True,
++            ),
+             # V3.2-style function_calls wrapper is foreign to V4: pass
+             # it and its contents through as plain content
+             (ParserState.CONTENT, "FOREIGN_START"): Transition(
