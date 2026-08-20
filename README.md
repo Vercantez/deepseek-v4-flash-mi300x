@@ -155,7 +155,7 @@ Most `patches/*.py` files are **full-file overlays** mounted read-only over thei
 
 | Overlay | Mounted over | Fixes | Needed when |
 | --- | --- | --- | --- |
-| `gpt_oss_triton_kernels_moe.pack128-fused-silu-fast-routing.py` | `vllm/.../fused_moe/experts/gpt_oss_triton_kernels_moe.py` | MXFP4 bitmatrix padding lanes + fused-SiLU grouped experts + fast DeepSeek routing | **Required** for the MXFP4 Triton path; the mask fix is [not yet upstream](https://github.com/doublewordai/vllm-amd-blog-doubleword/commit/c32932bb9ff6ad30b942e4835dd8b41601e7569e) |
+| `gpt_oss_triton_kernels_moe.pack128-fused-silu-fast-routing.py` | `vllm/.../fused_moe/experts/gpt_oss_triton_kernels_moe.py` | MXFP4 bitmatrix padding lanes + checkpoint-exact clamped fused-SiLU grouped experts + fast DeepSeek routing | **Required** for the MXFP4 Triton path; the routing mask fix is [not yet upstream](https://github.com/doublewordai/vllm-amd-blog-doubleword/commit/c32932bb9ff6ad30b942e4835dd8b41601e7569e) and the activation must honor the checkpoint's `swiglu_limit` |
 | `mxfp4.fused-silu.py` | `vllm/.../fused_moe/oracle/mxfp4.py` | Gate/up interleave layout for the fused-SiLU kernel | Required with the fused-SiLU overlay; skip both if you keep the standard SiLU path |
 | `triton-kernels-matmul-ogs-opt-flags.dsv4-mi300x.py` | `vllm/third_party/triton_kernels/matmul_ogs_details/opt_flags.py` | `gfx942` MXFP4 OGS tile geometry (up to 1,536 routed rows) | **Performance** on `gfx942`; the stock geometry slows sharply above 768 routed rows |
 | `fused_compress_quant_cache.fnuz-shuffle.py` | `vllm/models/deepseek_v4/common/ops/fused_compress_quant_cache.py` | **FNUZ FP8 + 16×16 preshuffle** in the Lightning Indexer cache writer | **Required on MI300X**; MI325X/MI355X use OCP FP8 and must keep the stock bytes |
@@ -172,7 +172,13 @@ Most `patches/*.py` files are **full-file overlays** mounted read-only over thei
 | `structural-tag-registry.deepseek-v4-auto.py` | `vllm/tool_parsers/structural_tag_registry.py` | Keep triggered DSML grammar enabled for `tool_choice=auto` + non-strict tools | Required for reliable OpenCode-style tool calls; based on [#40801](https://github.com/vllm-project/vllm/issues/40801) / [#46632](https://github.com/vllm-project/vllm/pull/46632) |
 | `parser-*.dsml-orphan.py` + `tool-parser-utils.dsml-orphan.py` | `vllm/parser/...` + `vllm/tool_parsers/utils.py` | Recover declared DSML invokes when the model omits the outer `tool_calls` wrapper; count prompt-opened reasoning spans in Responses usage | Required for long-context agent sessions; backported from [#49117](https://github.com/vllm-project/vllm/pull/49117) with the reasoning-count adaptation from [#49743](https://github.com/vllm-project/vllm/pull/49743) |
 
-### Three important correctness fixes
+### Four important correctness fixes
+
+**Checkpoint-exact SwiGLU.** DeepSeek V4 declares `swiglu_limit = 10`: clamp
+the gate above at 10 and clamp the up projection to `[-10, 10]` before the
+SiLU multiplication. The fused MXFP4 path passes that model value into its
+Triton activation and fails closed if it is absent. An ordinary, unclamped
+SwiGLU can amplify quantization outliers into stray tokens and junk output.
 
 **MXFP4 routing.** The MoE bitmatrix kernel pads its block columns to a Triton block size, but the padding lanes were masked against the global tensor bound instead of the logical block size. Under load, padded lanes corrupted the routing matrix, causing near-match tool names and forgotten schemas on long prompts. The one-line fix is `mask = (offs_local < BLOCK_SIZE) & (offs_global < nonzero_indx_size)`, taken from [Doubleword commit `c32932bb9`](https://github.com/doublewordai/vllm-amd-blog-doubleword/commit/c32932bb9ff6ad30b942e4835dd8b41601e7569e). The overlay also includes fused-SiLU and fast-routing changes for grouped MXFP4 experts.
 

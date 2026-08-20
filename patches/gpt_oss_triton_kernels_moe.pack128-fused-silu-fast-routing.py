@@ -630,12 +630,16 @@ def triton_kernel_moe_forward(
 
 
 @triton.jit
-def _silu_mul(inp):
+def _silu_mul(inp, limit: tl.constexpr):
     gate, up = tl.split(
         tl.reshape(inp, (inp.shape[0], inp.shape[1] // 2, 2))
     )
     gate = gate.to(tl.float32)
     up = up.to(tl.float32)
+    # DeepSeek V4 checkpoints require this pre-activation clamp. Applying an
+    # ordinary SwiGLU here can amplify MXFP4 outliers into junk output.
+    gate = tl.minimum(gate, limit)
+    up = tl.maximum(tl.minimum(up, limit), -limit)
     return gate / (1.0 + tl.exp(-gate)) * up
 
 
@@ -694,8 +698,11 @@ def triton_kernel_fused_experts(
     output_tensor = _resize_cache(output_tensor, (batch_dim, M, K))
 
     if activation == MoEActivation.SILU:
+        limit = quant_config.gemm1_clamp_limit
+        assert limit is not None, "DeepSeek fused SILU requires gemm1_clamp_limit"
         act = FusedActivation(
-            FnSpecs("silu_mul", _silu_mul, (), reduction_n=2), ()
+            FnSpecs("silu_mul", _silu_mul, ("limit",), reduction_n=2),
+            (limit,),
         )
     elif not use_legacy_triton_kernels:
         act = FusedActivation(
